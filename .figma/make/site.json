@@ -1,0 +1,11 @@
+{
+  "title": "Bageecha — Poll the Island",
+  "description": "Engage with your community through real-time anonymous polls on local issues, featuring swipe voting and instant results to spark lively discussions.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
