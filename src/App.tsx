@@ -1064,9 +1064,7 @@ function PollCard({
 
   const total = poll.votes.reduce((s, v) => s + v, 0)
   const pctOf = (i: number) =>
-    total > 0
-      ? Math.round((poll.votes[i] / total) * 100)
-      : Math.round(100 / poll.options.length)
+    total > 0 ? Math.round((poll.votes[i] / total) * 100) : 0
 
   const handleComment = () => {
     if (commentText.trim()) {
@@ -1799,9 +1797,7 @@ function SharedPollView({
   const meta = CATEGORY_META[poll.category] ?? CATEGORY_META.General
   const total = votes.reduce((s, v) => s + v, 0)
   const pctOf = (i: number) =>
-    total > 0
-      ? Math.round((votes[i] / total) * 100)
-      : Math.round(100 / votes.length)
+    total > 0 ? Math.round((votes[i] / total) * 100) : 0
 
   const castVote = (i: number) => {
     if (voted !== null) return
@@ -2284,9 +2280,7 @@ function PollResults({
   })
 
   const pctOf = (i: number) =>
-    total > 0
-      ? Math.round((poll.votes[i] / total) * 100)
-      : Math.round(100 / poll.options.length)
+    total > 0 ? Math.round((poll.votes[i] / total) * 100) : 0
   const winPct = winners.length === 1 ? pctOf(winners[0]) : 0
 
   return (
