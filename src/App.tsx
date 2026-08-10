@@ -118,6 +118,7 @@ interface Comment {
   id: string
   text: string
   timeAgo: string
+  createdAt?: number
   likes: number
   liked: boolean
   replies: Comment[]
@@ -149,6 +150,7 @@ type RawReply = {
   id: string
   text: string
   timeAgo: string
+  createdAt?: number
   likes: number
   likedBy?: string[]
 }
@@ -289,6 +291,7 @@ const toRawPoll = (poll: Poll, anonId: string): RawPoll => ({
         id: c.id,
         text: c.text,
         timeAgo: c.timeAgo,
+        createdAt: c.createdAt,
         likes: c.likes,
         likedBy: c.liked ? [anonId] : [],
         replies: Object.fromEntries(
@@ -298,6 +301,7 @@ const toRawPoll = (poll: Poll, anonId: string): RawPoll => ({
               id: r.id,
               text: r.text,
               timeAgo: r.timeAgo,
+              createdAt: r.createdAt,
               likes: r.likes,
               likedBy: r.liked ? [anonId] : [],
             },
@@ -308,7 +312,12 @@ const toRawPoll = (poll: Poll, anonId: string): RawPoll => ({
   ),
 })
 
-const toViewPoll = (d: RawPoll, anonId: string, profile: ProfileMap): Poll => {
+const toViewPoll = (
+  d: RawPoll,
+  anonId: string,
+  profile: ProfileMap,
+  now: number,
+): Poll => {
   const options = d.options ?? []
   const baseVotes = normalizeVotes(d)
   return {
@@ -333,13 +342,15 @@ const toViewPoll = (d: RawPoll, anonId: string, profile: ProfileMap): Poll => {
     comments: Object.values(d.comments ?? {}).map((c) => ({
       id: c.id,
       text: c.text,
-      timeAgo: c.timeAgo,
+      timeAgo: c.createdAt ? fmtTimeAgo(c.createdAt, now) : c.timeAgo,
+      createdAt: c.createdAt,
       likes: c.likes,
       liked: (c.likedBy ?? []).includes(anonId),
       replies: Object.values(c.replies ?? {}).map((r) => ({
         id: r.id,
         text: r.text,
-        timeAgo: r.timeAgo,
+        timeAgo: r.createdAt ? fmtTimeAgo(r.createdAt, now) : r.timeAgo,
+        createdAt: r.createdAt,
         likes: r.likes,
         liked: (r.likedBy ?? []).includes(anonId),
         replies: [],
@@ -2828,6 +2839,8 @@ function RulesModal({ onClose }: { onClose: () => void }) {
           padding: 24,
           width: "100%",
           maxWidth: 420,
+          maxHeight: "min(82vh, 640px)",
+          overflowY: "auto",
           boxShadow: "0 -24px 60px var(--purple-glow)",
         }}
       >
@@ -2967,6 +2980,8 @@ function NewPollModal({
           padding: 24,
           width: "100%",
           maxWidth: 500,
+          maxHeight: "min(85vh, 700px)",
+          overflowY: "auto",
           marginBottom: 8,
           boxShadow: "0 -24px 60px var(--purple-glow)",
         }}
@@ -3465,11 +3480,11 @@ export default function App() {
     toastTimer.current = window.setTimeout(() => setToast(null), ms)
   }
   const polls = useMemo(
-    () => rawPolls.map((d) => toViewPoll(d, anonId, profile)),
+    () => rawPolls.map((d) => toViewPoll(d, anonId, profile, now)),
     [rawPolls, profile, anonId, now],
   )
   const archivePolls = useMemo(
-    () => archiveRawPolls.map((d) => toViewPoll(d, anonId, profile)),
+    () => archiveRawPolls.map((d) => toViewPoll(d, anonId, profile, now)),
     [archiveRawPolls, profile, anonId, now],
   )
 
@@ -3688,6 +3703,23 @@ export default function App() {
     return () => window.removeEventListener("resize", measure)
   }, [view, isNarrow])
 
+  // Lock page scroll while a modal/overlay is open so wheel and touch input
+  // stay inside the dialog instead of scrolling the feed behind it.
+  useEffect(() => {
+    const overlayOpen =
+      showModal ||
+      showRules ||
+      welcomeOpen ||
+      confirmDelete !== null ||
+      adminDeniedName !== null
+    if (!overlayOpen) return
+    const prev = document.body.style.overflow
+    document.body.style.overflow = "hidden"
+    return () => {
+      document.body.style.overflow = prev
+    }
+  }, [showModal, showRules, welcomeOpen, confirmDelete, adminDeniedName])
+
   // Scroll-driven collapse of the header + filter bar. Starts animating only
   // while the user is scrolling and stops as soon as it settles, so it does
   // no work (and no jank) while the page is idle.
@@ -3761,6 +3793,7 @@ export default function App() {
       id: cid,
       text,
       timeAgo: "just now",
+      createdAt: Date.now(),
       likes: 0,
       likedBy: [],
       replies: {},
@@ -3784,6 +3817,7 @@ export default function App() {
       id: rid,
       text,
       timeAgo: "just now",
+      createdAt: Date.now(),
       likes: 0,
       likedBy: [],
     }
