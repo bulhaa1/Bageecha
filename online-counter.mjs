@@ -14,12 +14,12 @@ function broadcast() {
 }
 
 export function onlineCounterMiddleware(req, res, next) {
-  if (req.url?.split('?')[0] !== '/api/online') return next()
+  if (req.url?.split("?")[0] !== "/api/online") return next()
 
   res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
   })
   res.flushHeaders?.()
 
@@ -27,7 +27,7 @@ export function onlineCounterMiddleware(req, res, next) {
     res,
     heartbeat: setInterval(() => {
       try {
-        res.write(': ping\n\n')
+        res.write(": ping\n\n")
       } catch {
         /* ignore */
       }
@@ -36,7 +36,7 @@ export function onlineCounterMiddleware(req, res, next) {
   clients.add(client)
   broadcast()
 
-  req.on('close', () => {
+  req.on("close", () => {
     clearInterval(client.heartbeat)
     clients.delete(client)
     broadcast()

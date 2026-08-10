@@ -1,0 +1,36 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAdmin() {
+      return request.auth != null &&
+        request.auth.token.email == "chevplayz@gmail.com";
+    }
+
+    function isValidNewPoll(data) {
+      return data.question is string &&
+        data.question.size() > 0 &&
+        data.question.size() <= 120 &&
+        data.options is list &&
+        data.options.size() >= 2 &&
+        data.options.size() <= 7 &&
+        data.votes is list &&
+        data.votes.size() == data.options.size() &&
+        data.author is string &&
+        data.createdAt is number;
+    }
+
+    function onlySafeFieldUpdates() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly(['votes', 'upvotes', 'downvotes', 'comments']);
+    }
+
+    match /polls/{pollId} {
+      allow read: if true;
+      allow create: if isValidNewPoll(request.resource.data) &&
+        !request.resource.data.archived;
+      allow update: if isAdmin() || onlySafeFieldUpdates();
+      allow delete: if isAdmin();
+    }
+  }
+}

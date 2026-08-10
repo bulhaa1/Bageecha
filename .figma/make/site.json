@@ -1,8 +1,14 @@
 {
   "title": "Bageecha — Poll the Island",
-  "description": "Engage with your community through real-time anonymous polls on local issues, featuring swipe voting and instant results to spark lively discussions.",
-  "robots": {
-    "index": false
+  "description": "Bageecha is the Maldives' anonymous community polling board — vote, comment, and debate local hot takes before polls close.",
+  "icons": {
+    "icon": "favicon.svg"
+  },
+  "openGraph": {
+    "image": "https://bulhaa1.github.io/Bageecha/og-image.png"
+  },
+  "customScripts": {
+    "headStart": "<meta name=\"theme-color\" content=\"#111215\"><meta property=\"og:url\" content=\"https://bulhaa1.github.io/Bageecha/\"><meta property=\"og:type\" content=\"website\"><meta property=\"og:site_name\" content=\"Bageecha\"><link rel=\"apple-touch-icon\" href=\"apple-touch-icon.png\">"
   },
   "accessibility": {
     "addBypassLinks": false,
