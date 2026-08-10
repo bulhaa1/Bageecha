@@ -342,14 +342,18 @@ const toViewPoll = (
     comments: Object.values(d.comments ?? {}).map((c) => ({
       id: c.id,
       text: c.text,
-      timeAgo: c.createdAt ? fmtTimeAgo(c.createdAt, now) : c.timeAgo,
+      timeAgo: c.createdAt
+        ? fmtTimeAgo(c.createdAt, now)
+        : fmtTimeAgo(d.createdAt, now),
       createdAt: c.createdAt,
       likes: c.likes,
       liked: (c.likedBy ?? []).includes(anonId),
       replies: Object.values(c.replies ?? {}).map((r) => ({
         id: r.id,
         text: r.text,
-        timeAgo: r.createdAt ? fmtTimeAgo(r.createdAt, now) : r.timeAgo,
+        timeAgo: r.createdAt
+          ? fmtTimeAgo(r.createdAt, now)
+          : fmtTimeAgo(d.createdAt, now),
         createdAt: r.createdAt,
         likes: r.likes,
         liked: (r.likedBy ?? []).includes(anonId),
