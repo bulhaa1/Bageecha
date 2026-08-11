@@ -8755,7 +8755,7 @@ export default function App() {
               letterSpacing: "0.02em",
             }}
           >
-            made by bulhaa1
+            made by zaylo69
           </span>
         </div>
       </main>
