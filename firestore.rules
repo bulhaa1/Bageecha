@@ -1,10 +1,15 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-
     function isAdmin() {
       return request.auth != null &&
+        request.auth.token.email_verified == true &&
+        request.auth.token.sign_in_provider == "google.com" &&
         request.auth.token.email == "chevplayz@gmail.com";
+    }
+
+    function validString(s, minLen, maxLen) {
+      return s is string && s.size() >= minLen && s.size() <= maxLen;
     }
 
     function isValidNewPoll(data) {
@@ -14,15 +19,106 @@ service cloud.firestore {
         data.options is list &&
         data.options.size() >= 2 &&
         data.options.size() <= 7 &&
+        data.options.all(o => o is string && o.size() > 0 && o.size() <= 50) &&
         data.votes is list &&
         data.votes.size() == data.options.size() &&
+        data.votes.all(v => v is int && v >= 0 && v <= 1000000) &&
         data.author is string &&
-        data.createdAt is number;
+        data.author.size() > 0 &&
+        data.author.size() <= 30 &&
+        data.createdAt is number &&
+        (!data.keys().hasAny(['description']) ||
+          (data.description is string && data.description.size() > 0 && data.description.size() <= 280)) &&
+        (!data.keys().hasAny(['category']) ||
+          (data.category is string && data.category.size() > 0 && data.category.size() <= 20)) &&
+        (!data.keys().hasAny(['durationH']) ||
+          (data.durationH is int && data.durationH >= 1 && data.durationH <= 48)) &&
+        (!data.keys().hasAny(['upvotes']) || data.upvotes is int && data.upvotes >= 0 && data.upvotes <= 1000000) &&
+        (!data.keys().hasAny(['downvotes']) || data.downvotes is int && data.downvotes >= 0 && data.downvotes <= 1000000) &&
+        (!data.keys().hasAny(['hot']) || data.hot is bool) &&
+        (!data.keys().hasAny(['creatorId']) || (data.creatorId is string && data.creatorId.size() > 0 && data.creatorId.size() <= 40)) &&
+        (!data.keys().hasAny(['comments']) ||
+          (data.comments is map && data.comments.size() <= 500 &&
+           data.comments.values().all(c => c is map &&
+             c.id is string && c.id.size() > 0 && c.id.size() <= 40 &&
+             c.text is string && c.text.size() > 0 && c.text.size() <= 500 &&
+             c.timeAgo is string && c.timeAgo.size() > 0 && c.timeAgo.size() <= 30 &&
+             c.createdAt is int &&
+             c.likes is int && c.likes >= 0 && c.likes <= 100000 &&
+             c.likedBy is list && c.likedBy.size() <= 500 &&
+             c.likedBy.all(u => u is string && u.size() > 0 && u.size() <= 40) &&
+             (!c.keys().hasAny(['replies']) ||
+               (c.replies is map && c.replies.size() <= 100 &&
+                c.replies.values().all(r => r is map &&
+                  r.id is string && r.id.size() > 0 && r.id.size() <= 40 &&
+                  r.text is string && r.text.size() > 0 && r.text.size() <= 500 &&
+                  r.timeAgo is string && r.timeAgo.size() > 0 && r.timeAgo.size() <= 30 &&
+                  r.createdAt is int &&
+                  r.likes is int && r.likes >= 0 && r.likes <= 100000 &&
+                  r.likedBy is list && r.likedBy.size() <= 500 &&
+                  r.likedBy.all(u => u is string && u.size() > 0 && u.size() <= 40))
+               )))));
+    }
+
+    function isValidCommentsUpdate(comments) {
+      return comments is map && comments.size() <= 500 &&
+        comments.values().all(c => c is map &&
+          c.id is string && c.id.size() > 0 && c.id.size() <= 40 &&
+          c.text is string && c.text.size() > 0 && c.text.size() <= 500 &&
+          c.timeAgo is string && c.timeAgo.size() > 0 && c.timeAgo.size() <= 30 &&
+          c.createdAt is int &&
+          c.likes is int && c.likes >= 0 && c.likes <= 100000 &&
+          c.likedBy is list && c.likedBy.size() <= 500 &&
+          c.likedBy.all(u => u is string && u.size() > 0 && u.size() <= 40) &&
+          (!c.keys().hasAny(['replies']) ||
+            (c.replies is map && c.replies.size() <= 100 &&
+             c.replies.values().all(r => r is map &&
+               r.id is string && r.id.size() > 0 && r.id.size() <= 40 &&
+               r.text is string && r.text.size() > 0 && r.text.size() <= 500 &&
+               r.timeAgo is string && r.timeAgo.size() > 0 && r.timeAgo.size() <= 30 &&
+               r.createdAt is int &&
+               r.likes is int && r.likes >= 0 && r.likes <= 100000 &&
+               r.likedBy is list && r.likedBy.size() <= 500 &&
+               r.likedBy.all(u => u is string && u.size() > 0 && u.size() <= 40)
+             ))));
     }
 
     function onlySafeFieldUpdates() {
-      return request.resource.data.diff(resource.data).affectedKeys()
-        .hasOnly(['votes', 'upvotes', 'downvotes', 'comments']);
+      let keys = request.resource.data.diff(resource.data).affectedKeys();
+
+      // Vote fields must stay within safe numeric bounds and match the
+      // option list size; comments must match the validated shape.
+      function safeVotes() {
+        return request.resource.data.votes is list &&
+          request.resource.data.votes.size() == resource.data.options.size() &&
+          request.resource.data.votes.all(v => v is int && v >= 0 && v <= 1000000);
+      }
+
+      function safeUpvotes() {
+        return request.resource.data.upvotes is int &&
+          request.resource.data.upvotes >= 0 &&
+          request.resource.data.upvotes <= 1000000;
+      }
+
+      function safeDownvotes() {
+        return request.resource.data.downvotes is int &&
+          request.resource.data.downvotes >= 0 &&
+          request.resource.data.downvotes <= 1000000;
+      }
+
+      function safeComments() {
+        return (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['comments']) ||
+                isValidCommentsUpdate(request.resource.data.comments));
+      }
+
+      return keys.hasOnly([
+        'votes', 'upvotes', 'downvotes', 'comments', 'archived'
+      ]) &&
+        (!keys.hasAny(['votes']) || safeVotes()) &&
+        (!keys.hasAny(['upvotes']) || safeUpvotes()) &&
+        (!keys.hasAny(['downvotes']) || safeDownvotes()) &&
+        (!keys.hasAny(['comments']) || safeComments()) &&
+        (!keys.hasAny(['archived']) || request.resource.data.archived == true);
     }
 
     match /polls/{pollId} {

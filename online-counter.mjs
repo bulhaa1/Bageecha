@@ -1,4 +1,5 @@
 const clients = new Set()
+const MAX_CLIENTS = 200
 const pingInterval = 25000
 
 function broadcast() {
@@ -14,7 +15,11 @@ function broadcast() {
 }
 
 export function onlineCounterMiddleware(req, res, next) {
-  if (req.url?.split("?")[0] !== "/api/online") return next()
+  const pathname = req.url?.split("?")[0] ?? ""
+
+  // Match the endpoint at the site root or behind a base path
+  // (e.g. /Bageecha/api/online in dev/preview deployments).
+  if (!pathname.endsWith("/api/online")) return next()
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -33,6 +38,14 @@ export function onlineCounterMiddleware(req, res, next) {
       }
     }, pingInterval),
   }
+  if (clients.size >= MAX_CLIENTS) {
+    res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" })
+
+    res.end("Online counter at capacity")
+
+    return
+  }
+
   clients.add(client)
   broadcast()
 

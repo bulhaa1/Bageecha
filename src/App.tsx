@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react"
+import { useState, useEffect, useRef, useMemo, useLayoutEffect, type ReactNode, type CSSProperties } from "react"
 
 import {
   collection,
@@ -15,6 +15,10 @@ import {
   arrayUnion,
   arrayRemove,
   runTransaction,
+  getDocs,
+  getDoc,
+  startAfter,
+  type QueryDocumentSnapshot,
 } from "firebase/firestore"
 
 import {
@@ -85,6 +89,12 @@ const playVoteSound = () => {
   setTimeout(() => playTone(783.99, 0.09, "triangle", 0.12), 60)
 }
 
+const playCreateSound = () => {
+  playTone(440, 0.08, "sine", 0.16)
+
+  setTimeout(() => playTone(659.25, 0.1, "sine", 0.13), 75)
+}
+
 const playUpvoteSound = () => {
   playTone(659.25, 0.07, "sine", 0.16)
 
@@ -143,7 +153,14 @@ const decodeShare = (s: string): Partial<Poll> | null => {
 
     const data = JSON.parse(json)
 
-    if (!data || !data.question || !Array.isArray(data.options)) return null
+    if (
+      !data ||
+      typeof data.question !== "string" ||
+      !Array.isArray(data.options) ||
+      data.options.length < 2 ||
+      !data.options.every((o: unknown) => typeof o === "string")
+    )
+      return null
 
     return data
   } catch {
@@ -508,7 +525,7 @@ const toViewPoll = (
 
     archived: d.archived ?? false,
 
-    expired: d.archived || Date.now() - d.createdAt > pollLifetimeMs(d),
+    expired: d.archived || now - d.createdAt > pollLifetimeMs(d),
 
     voted: profile[d.id]?.voted ?? null,
 
@@ -550,26 +567,72 @@ const toViewPoll = (
   }
 }
 
+// Merge two raw-poll arrays by id, deduplicating. The first array wins on
+// conflicts (its caller passes the fresher window first).
+const mergeRawById = (a: RawPoll[], b: RawPoll[]): RawPoll[] => {
+  const byId = new Map<string, RawPoll>()
+
+  for (const p of b) byId.set(p.id, p)
+
+  for (const p of a) byId.set(p.id, p)
+
+  return [...byId.values()]
+}
+
+// Live-window shift handling: when new polls push the oldest window doc out
+// of the snapshot, it is not deleted — it just left the query window. Verify
+// with a cheap getDoc: if it still exists, absorb it into the paginated pile
+// so it stays visible; if it's gone (admin delete), let it drop.
+const absorbWindowShift = (
+  prevWindowRef: { current: Set<string> },
+  newDocs: { id: string }[],
+  setter: (fn: (prev: RawPoll[]) => RawPoll[]) => void,
+) => {
+  const newIds = new Set(newDocs.map((d) => d.id))
+
+  const dropped: string[] = []
+
+  for (const id of prevWindowRef.current) {
+    if (!newIds.has(id)) dropped.push(id)
+  }
+
+  prevWindowRef.current = newIds
+
+  if (dropped.length === 0) return
+
+  Promise.all(dropped.map((id) => getDoc(doc(db, "polls", id))))
+    .then((results) => {
+      const surviving = results
+        .filter((s) => s.exists())
+        .map((s) => s.data() as RawPoll)
+
+      if (surviving.length > 0) setter((prev) => mergeRawById(prev, surviving))
+    })
+    .catch(() => {
+      /* drop the shifted-out docs on network error */
+    })
+}
+
 const CTA_PHRASES = [
-  "Ask the island something 🌿",
+  "Ask the island something",
 
-  "What are the islanders thinking? 🤔",
+  "What are the islanders thinking?",
 
-  "Drop a question into the lagoon 🌊",
+  "Drop a question into the lagoon",
 
-  "Put the island to a vote 🗳️",
+  "Put the island to a vote",
 
-  "Start a fresh debate 🔥",
+  "Start a fresh debate",
 
-  "Your question, their take ✨",
+  "Your question, their take",
 
-  "Poll the whole atoll 🏝️",
+  "Poll the whole atoll",
 
-  "Ask away, dhariyaa! 🐠",
+  "Ask away, dhariyaa!",
 
-  "Got a hot take? Spill it ☕",
+  "Got a hot take? Spill it",
 
-  "Test the waters with a poll 🏄",
+  "Test the waters with a poll",
 ]
 
 const CATEGORY_META: Record<Category, {
@@ -578,10 +641,8 @@ const CATEGORY_META: Record<Category, {
   text: string
 
   border: string
-
-  emoji: string
 }> = {
-  Food: { bg: "#ff2d7820", text: "#ff6b9d", border: "#ff2d7835", emoji: "🍛" },
+  Food: { bg: "#ff2d7820", text: "#ff6b9d", border: "#ff2d7835" },
 
   Transport: {
     bg: "#00e5ff18",
@@ -589,8 +650,6 @@ const CATEGORY_META: Record<Category, {
     text: "#00e5ff",
 
     border: "#00e5ff30",
-
-    emoji: "🚢",
   },
 
   Lifestyle: {
@@ -599,8 +658,6 @@ const CATEGORY_META: Record<Category, {
     text: "#ffe033",
 
     border: "#ffe03335",
-
-    emoji: "✨",
   },
 
   "Hot Take": {
@@ -609,8 +666,6 @@ const CATEGORY_META: Record<Category, {
     text: "#ff2d78",
 
     border: "#ff2d7840",
-
-    emoji: "🔥",
   },
 
   Community: {
@@ -619,8 +674,6 @@ const CATEGORY_META: Record<Category, {
     text: "#b57bff",
 
     border: "#b57bff35",
-
-    emoji: "🏘️",
   },
 
   Sports: {
@@ -629,8 +682,6 @@ const CATEGORY_META: Record<Category, {
     text: "#5eead4",
 
     border: "#5eead435",
-
-    emoji: "⚽",
   },
 
   Politics: {
@@ -639,13 +690,11 @@ const CATEGORY_META: Record<Category, {
     text: "#fb923c",
 
     border: "#fb923c35",
-
-    emoji: "🗳️",
   },
 
-  Tech: { bg: "#60a5fa20", text: "#60a5fa", border: "#60a5fa35", emoji: "💻" },
+  Tech: { bg: "#60a5fa20", text: "#60a5fa", border: "#60a5fa35" },
 
-  Music: { bg: "#e879f920", text: "#e879f9", border: "#e879f935", emoji: "🎵" },
+  Music: { bg: "#e879f920", text: "#e879f9", border: "#e879f935" },
 
   Dating: {
     bg: "#f4717120",
@@ -653,8 +702,6 @@ const CATEGORY_META: Record<Category, {
     text: "#f47171",
 
     border: "#f4717135",
-
-    emoji: "💘",
   },
 
   Environment: {
@@ -663,8 +710,6 @@ const CATEGORY_META: Record<Category, {
     text: "#4ade80",
 
     border: "#4ade8035",
-
-    emoji: "🌿",
   },
 
   Fashion: {
@@ -673,8 +718,6 @@ const CATEGORY_META: Record<Category, {
     text: "#f9a8d4",
 
     border: "#f9a8d435",
-
-    emoji: "👗",
   },
 
   General: {
@@ -683,8 +726,6 @@ const CATEGORY_META: Record<Category, {
     text: "#a89bd4",
 
     border: "#8a7fb045",
-
-    emoji: "🌴",
   },
 
   Controversial: {
@@ -693,14 +734,12 @@ const CATEGORY_META: Record<Category, {
     text: "#f43f5e",
 
     border: "#f43f5e35",
-
-    emoji: "⚠️",
   },
 }
 
 // Light-touch styling: every category chip uses one muted accent so the UI
 
-// stays calm. Each category keeps its emoji; custom categories get 🏷️.
+// stays calm. Custom categories get a tag icon.
 
 const NEUTRAL_CATEGORY_META = {
   bg: "var(--primary-soft-bg)",
@@ -708,17 +747,56 @@ const NEUTRAL_CATEGORY_META = {
   text: "var(--primary)",
 
   border: "var(--primary-soft)",
-
-  emoji: "🏷️",
 }
 
-const categoryMeta = (cat: string) => ({
-  ...NEUTRAL_CATEGORY_META,
+// Darker versions of each category accent for light themes, where the vivid
+// dark-theme hues don't have enough contrast against white surfaces.
+const LIGHT_CATEGORY_TEXT: Record<string, string> = {
+  Food: "#c2255c",
+  Transport: "#0e7490",
+  Lifestyle: "#a16207",
+  "Hot Take": "#be185d",
+  Community: "#6d28d9",
+  Sports: "#0f766e",
+  Politics: "#c2410c",
+  Tech: "#1d4ed8",
+  Music: "#a21caf",
+  Dating: "#b91c1c",
+  Environment: "#15803d",
+  Fashion: "#c2458f",
+  General: "#6b5ea8",
+  Controversial: "#be123c",
+}
 
-  emoji:
-    CATEGORY_META[(cat as keyof typeof CATEGORY_META)]?.emoji ??
-    NEUTRAL_CATEGORY_META.emoji,
-})
+const categoryMeta = (cat: string) => {
+  const meta = {
+    ...NEUTRAL_CATEGORY_META,
+
+    ...CATEGORY_META[cat as keyof typeof CATEGORY_META],
+  }
+
+  const isLight =
+    typeof document !== "undefined" &&
+    document.documentElement.getAttribute("data-theme") === "dawn"
+
+  if (!isLight) return meta
+
+  const light = LIGHT_CATEGORY_TEXT[cat]
+
+  if (light) {
+    meta.text = light
+
+    meta.border = `${light}38`
+  } else {
+    meta.text = "#9a2f5d"
+
+    meta.bg = "rgba(194, 87, 127, 0.1)"
+
+    meta.border = "rgba(154, 47, 93, 0.35)"
+  }
+
+  return meta
+}
 
 const INITIAL_POLLS: Omit<Poll, "createdAt" | "votes" | "upvotes" | "downvotes" | "userVote">[] =
   [
@@ -1120,7 +1198,7 @@ const ALL_FILTERS: FilterOption[] = [
   { label: "All", value: "all" },
 
   ...(Object.keys(CATEGORY_META) as Category[]).map((c) => ({
-    label: `${CATEGORY_META[c].emoji} ${c}`,
+    label: c,
 
     value: c as "all" | Category,
   })),
@@ -1188,11 +1266,23 @@ function useIsNarrow(): boolean {
   const [narrow, setNarrow] = useState(() => window.innerWidth < 640)
 
   useEffect(() => {
-    const onResize = () => setNarrow(window.innerWidth < 640)
+    let raf = 0
+
+    const onResize = () => {
+      window.cancelAnimationFrame(raf)
+
+      raf = window.requestAnimationFrame(() =>
+        setNarrow(window.innerWidth < 640),
+      )
+    }
 
     window.addEventListener("resize", onResize)
 
-    return () => window.removeEventListener("resize", onResize)
+    return () => {
+      window.cancelAnimationFrame(raf)
+
+      window.removeEventListener("resize", onResize)
+    }
   }, [])
 
   return narrow
@@ -1312,6 +1402,449 @@ function ArchiveIcon({ size = 16 }: { size?: number }) {
   )
 }
 
+function SearchIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <circle cx="11" cy="11" r="6.5" />
+      <path d="M20 20l-4.3-4.3" />
+    </svg>
+  )
+}
+
+function StarIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <polygon points="12 3.5 14.7 9.2 21 9.9 16.3 14.3 17.6 20.5 12 17.4 6.4 20.5 7.7 14.3 3 9.9 9.3 9.2" />
+    </svg>
+  )
+}
+
+function ClockIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 7.5V12l3 2" />
+    </svg>
+  )
+}
+
+function ChartIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M3.5 20.5h17" />
+      <path d="M6.5 20.5V12" />
+      <path d="M12 20.5V7" />
+      <path d="M17.5 20.5V10" />
+    </svg>
+  )
+}
+
+function ListIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M8.5 6h12" />
+      <path d="M8.5 12h12" />
+      <path d="M8.5 18h12" />
+      <path d="M3.5 6h.01" />
+      <path d="M3.5 12h.01" />
+      <path d="M3.5 18h.01" />
+    </svg>
+  )
+}
+
+function GridIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <rect x="3.5" y="3.5" width="7" height="7" rx="1.5" />
+      <rect x="13.5" y="3.5" width="7" height="7" rx="1.5" />
+      <rect x="3.5" y="13.5" width="7" height="7" rx="1.5" />
+      <rect x="13.5" y="13.5" width="7" height="7" rx="1.5" />
+    </svg>
+  )
+}
+
+function TrendingUpIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M3 17l6-6 4 4 8-8" />
+      <path d="M14 7h7v7" />
+    </svg>
+  )
+}
+
+function BoltIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M13 2L4.5 13.5H11L9.5 22 19.5 10H13z" />
+    </svg>
+  )
+}
+
+function TrophyIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M6 4.5h12v4a6 6 0 0 1-12 0z" />
+      <path d="M6 6H3.8a1.9 1.9 0 0 0 1.9 2.6H6" />
+      <path d="M18 6h2.2a1.9 1.9 0 0 1-1.9 2.6H18" />
+      <path d="M12 14.5v3" />
+      <path d="M8.5 20.5h7" />
+    </svg>
+  )
+}
+
+function BallotIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <rect x="3.5" y="4.5" width="17" height="16" rx="2" />
+      <path d="M7 9.5l2 2 3.5-3.5" />
+      <path d="M7 15.5h6" />
+    </svg>
+  )
+}
+
+function ChatIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-8l-4 3.5V18H6a2 2 0 0 1-2-2z" />
+    </svg>
+  )
+}
+
+function LinkIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M10 13.5a5 5 0 0 0 7.07.06l2.2-2.2a5 5 0 0 0-7.07-7.07l-1.3 1.3" />
+      <path d="M14 10.5a5 5 0 0 0-7.07-.06l-2.2 2.2a5 5 0 0 0 7.07 7.07l1.3-1.3" />
+    </svg>
+  )
+}
+
+function TrashIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M4 6.5h16" />
+      <path d="M9 3.5h6" />
+      <path d="M6.5 6.5l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9l.8-12" />
+      <path d="M10 10.5v6" />
+      <path d="M14 10.5v6" />
+    </svg>
+  )
+}
+
+function FlagIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M5 20.5v-16" />
+      <path d="M5 5c2.5-1.5 4.5-1.5 7 0s4.5 1.5 7 0v8c-2.5 1.5-4.5 1.5-7 0s-4.5-1.5-7 0" />
+    </svg>
+  )
+}
+
+function SproutIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path d="M12 20.5v-7" />
+      <path d="M12 13.5c-3.5 0-6.5-2.4-6.5-6.2 3.5 0 6.5 2.4 6.5 6.2z" />
+      <path d="M12 13.5c0-3.8 3-6.2 6.5-6.2 0 3.8-3 6.2-6.5 6.2z" />
+    </svg>
+  )
+}
+
+function CategoryIcon({ cat, size = 14 }: { cat: string; size?: number }) {
+  const p = {
+    viewBox: "0 0 24 24",
+    width: size,
+    height: size,
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.8,
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+    "aria-hidden": true,
+    style: { display: "block" },
+  } as const
+
+  switch (cat) {
+    case "Food":
+      return (
+        <svg {...p}>
+          <path d="M4.5 11.5a7.5 7.5 0 0 0 15 0z" />
+          <path d="M8 8.5c-.5-1.5.5-2.5 2-3" />
+          <path d="M13 8.5c.5-1.5-.5-2.5-2-3" />
+        </svg>
+      )
+
+    case "Transport":
+      return (
+        <svg {...p}>
+          <path d="M3 15l2-6h14l2 6" />
+          <path d="M5 15h14" />
+          <path d="M3.5 18.5h17" />
+        </svg>
+      )
+
+    case "Lifestyle":
+      return (
+        <svg {...p}>
+          <path d="M12 4l1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7-4.7-1.8 4.7-1.8z" />
+          <path d="M18.5 3.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z" />
+        </svg>
+      )
+
+    case "Hot Take":
+      return <BoltIcon size={size} />
+
+    case "Community":
+      return (
+        <svg {...p}>
+          <path d="M4 11l8-6.5L20 11" />
+          <path d="M6 10v9.5h12V10" />
+          <path d="M10 19.5v-5h4v5" />
+        </svg>
+      )
+
+    case "Sports":
+      return (
+        <svg {...p}>
+          <circle cx="12" cy="12" r="8.5" />
+          <path d="M12 3.5c-2 2.5-3 5.2-3 8.5s1 6 3 8.5c2-2.5 3-5.2 3-8.5s-1-6-3-8.5z" />
+          <path d="M3.8 9h16.4" />
+          <path d="M3.8 15h16.4" />
+        </svg>
+      )
+
+    case "Politics":
+      return <BallotIcon size={size} />
+
+    case "Tech":
+      return (
+        <svg {...p}>
+          <rect x="3.5" y="4.5" width="17" height="12" rx="2" />
+          <path d="M9.5 20.5h5" />
+          <path d="M12 16.5v4" />
+        </svg>
+      )
+
+    case "Music":
+      return (
+        <svg {...p}>
+          <path d="M9 17.5V6l8-2v11.5" />
+          <circle cx="6.5" cy="17.5" r="2.5" />
+          <circle cx="14.5" cy="15.5" r="2.5" />
+        </svg>
+      )
+
+    case "Dating":
+      return (
+        <svg {...p}>
+          <path d="M12 19.5C7 15.5 4 12.7 4 9.5A4 4 0 0 1 12 7a4 4 0 0 1 8 2.5c0 3.2-3 6-8 10z" />
+        </svg>
+      )
+
+    case "Environment":
+      return <SproutIcon size={size} />
+
+    case "Fashion":
+      return (
+        <svg {...p}>
+          <path d="M8.5 4.5L5 7.5l2.5 2.5 1-1v10h7V9l1 1L19 7.5 15.5 4.5c-1.2 1.5-5.8 1.5-7 0z" />
+        </svg>
+      )
+
+    case "General":
+      return (
+        <svg {...p}>
+          <circle cx="12" cy="12" r="8.5" />
+          <path d="M3.5 12h17" />
+          <path d="M12 3.5c-2.8 2.2-2.8 14.8 0 17" />
+          <path d="M12 3.5c2.8 2.2 2.8 14.8 0 17" />
+        </svg>
+      )
+
+    case "Controversial":
+      return (
+        <svg {...p}>
+          <path d="M12 4.5L21 20H3z" />
+          <path d="M12 10v4.5" />
+          <path d="M12 17.2v.3" />
+        </svg>
+      )
+
+    default:
+      return (
+        <svg {...p}>
+          <path d="M3.5 11V5.5A2 2 0 0 1 5.5 3.5H11L20.5 13 13 20.5z" />
+          <circle cx="8" cy="8" r="1.2" />
+        </svg>
+      )
+  }
+}
+
 function ThemePicker({
   theme,
 
@@ -1359,9 +1892,9 @@ function ThemePicker({
 
           borderRadius: 9,
 
-          padding: compact ? "0 10px" : "0 14px",
+          padding: compact ? "0 12px" : "0 14px",
 
-          height: compact ? 34 : 36,
+          height: compact ? 40 : 36,
 
           color: "var(--text-dim)",
 
@@ -1384,9 +1917,9 @@ function ThemePicker({
               <span
                 key={i}
                 style={{
-                  width: 7,
+                  width: compact ? 8 : 7,
 
-                  height: 7,
+                  height: compact ? 8 : 7,
 
                   borderRadius: "50%",
 
@@ -1540,6 +2073,16 @@ function PollCard({
   isAdmin = false,
 
   onDelete,
+
+  animateEnter = false,
+
+  enterDelay = 0,
+
+  openResults = false,
+
+  isNarrow = false,
+
+  bareResults = false,
 }: {
   poll: Poll
 
@@ -1547,13 +2090,13 @@ function PollCard({
 
   onVote: (id: string, option: number) => void
 
-  onComment: (id: string, text: string) => void
+  onComment: (id: string, text: string) => boolean
 
   onLikeComment: (pollId: string, commentId: string) => void
 
   onRedditVote: (id: string, vote: "up" | "down") => void
 
-  onReplyComment: (pollId: string, commentId: string, text: string) => void
+  onReplyComment: (pollId: string, commentId: string, text: string) => boolean
 
   onShare: (poll: Poll) => void
 
@@ -1564,6 +2107,16 @@ function PollCard({
   isAdmin?: boolean
 
   onDelete?: (id: string) => void
+
+  animateEnter?: boolean
+
+  enterDelay?: number
+
+  openResults?: boolean
+
+  isNarrow?: boolean
+
+  bareResults?: boolean
 }) {
   const [showComments, setShowComments] = useState(openComments)
 
@@ -1579,7 +2132,22 @@ function PollCard({
 
   const [animateComments, setAnimateComments] = useState(false)
 
-  const [showResults, setShowResults] = useState(false)
+  const showResults = openResults || poll.expired
+
+  const [entered, setEntered] = useState(false)
+
+  // Entrance animation is strictly one-shot: once it has played (delay +
+  // duration), the class is removed so no re-render, reorder, or re-sort can
+  // ever restart it. Card positions settle and stay put.
+  useEffect(() => {
+    if (!animateEnter || entered) return
+
+    const t = window.setTimeout(() => setEntered(true), (enterDelay ?? 0) + 480)
+
+    return () => window.clearTimeout(t)
+  }, [animateEnter, entered, enterDelay])
+
+  const animating = animateEnter && !entered
 
   const meta = categoryMeta(poll.category)
 
@@ -1617,26 +2185,28 @@ function PollCard({
 
   const handleComment = () => {
     if (commentText.trim()) {
-      onComment(poll.id, commentText.trim())
-
-      setCommentText("")
+      // Only clear the input when the write was accepted (a pending
+      // previous write leaves the text in place so nothing is lost).
+      if (onComment(poll.id, commentText.trim())) setCommentText("")
     }
   }
 
   const handleReply = () => {
     if (replyTo && replyText.trim()) {
-      onReplyComment(poll.id, replyTo, replyText.trim())
+      if (onReplyComment(poll.id, replyTo, replyText.trim())) {
+        setReplyText("")
 
-      setReplyText("")
-
-      setReplyTo(null)
+        setReplyTo(null)
+      }
     }
   }
 
   return (
     <div
       id={`poll-card-${poll.id}`}
-      className="card-hover"
+      className={
+        "card-hover" + (animating ? " card-enter" : "")
+      }
       onMouseEnter={() => setHovering(true)}
       onMouseLeave={() => setHovering(false)}
       style={{
@@ -1644,10 +2214,16 @@ function PollCard({
 
         overflow: "hidden",
 
+        minWidth: 0,
+
+        maxWidth: "100%",
+
         background:
           "linear-gradient(160deg, var(--card-top) 0%, var(--card-bottom) 100%)",
 
         border: `1px solid var(--border)`,
+
+        ...(animating ? { animationDelay: `${enterDelay}ms` } : {}),
       }}
     >
       {/* Coloured top accent bar */}
@@ -1688,9 +2264,20 @@ function PollCard({
               border: `1px solid ${meta.border}`,
             }}
           >
-            {meta.emoji} {poll.category}
+            <span
+              style={{
+                display: "inline-flex",
+
+                alignItems: "center",
+
+                gap: 5,
+              }}
+            >
+              <CategoryIcon cat={poll.category} size={12} />
+              {poll.category}
+            </span>
           </span>
-          {poll.hot && (
+          {!compact && poll.hot && (
             <span
               className="tag-pill"
               style={{
@@ -1705,10 +2292,10 @@ function PollCard({
                 border: "1px solid var(--primary-soft)",
               }}
             >
-              🔥 Trending
+              <TrendingUpIcon size={13} /> Trending
             </span>
           )}
-          {poll.expired && (
+          {!compact && poll.expired && (
             <span
               className="tag-pill"
               style={{
@@ -1721,9 +2308,15 @@ function PollCard({
                 borderRadius: 99,
 
                 border: "1px solid var(--accent-soft)",
+
+                display: "inline-flex",
+
+                alignItems: "center",
+
+                gap: 5,
               }}
             >
-              🏁 Closed
+              {!bareResults && <FlagIcon size={13} />} Closed
             </span>
           )}
           <span
@@ -1796,6 +2389,20 @@ function PollCard({
             margin: "0 0 14px",
 
             lineHeight: 1.35,
+
+            overflowWrap: "anywhere",
+
+            ...(compact
+              ? {
+                  display: "-webkit-box",
+
+                  WebkitLineClamp: 2,
+
+                  WebkitBoxOrient: "vertical",
+
+                  overflow: "hidden",
+                }
+              : {}),
           }}
         >
           {poll.question}
@@ -1818,29 +2425,30 @@ function PollCard({
         )}
 
         {/* Vote options */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {poll.expired && (
-            <p
-              style={{
-                margin: "0 0 2px",
+        {!bareResults && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {poll.expired && (
+              <p
+                style={{
+                  margin: "0 0 2px",
 
-                color: "var(--accent)",
+                  color: "var(--accent)",
 
-                fontSize: 12,
+                  fontSize: 12,
 
-                fontWeight: 800,
+                  fontWeight: 800,
 
-                display: "flex",
+                  display: "flex",
 
-                alignItems: "center",
+                  alignItems: "center",
 
-                gap: 5,
-              }}
-            >
-              🏁 This poll closed after {poll.durationH ?? 48}h — voting is
-              done.
-            </p>
-          )}
+                  gap: 5,
+                }}
+              >
+                <FlagIcon size={13} /> This poll closed after {poll.durationH ?? 48}h — voting is
+                done.
+              </p>
+            )}
           {poll.options.map((label, i) => {
             const pct = pctOf(i)
 
@@ -1896,19 +2504,14 @@ function PollCard({
                   opacity: poll.expired ? 0.65 : 1,
                 }}
               >
-                <div
-                  className="vote-bar"
+                <AnimatedBar
+                  pct={pct}
+                  className={isVoted ? "vote-bar vote-bar-lit" : "vote-bar"}
                   style={{
                     position: "absolute",
-
                     top: 0,
-
                     left: 0,
-
                     height: "100%",
-
-                    width: `${pct}%`,
-
                     background: barBg,
                   }}
                 />
@@ -1933,6 +2536,8 @@ function PollCard({
 
                       fontWeight: isVoted ? 800 : 600,
 
+                      overflowWrap: "anywhere",
+
                       color: isVoted
                         ? barColor
                         : didVote
@@ -1945,12 +2550,13 @@ function PollCard({
                     {label}
                   </span>
                   <span
+                    key={pct}
                     style={{
                       fontFamily: "Satoshi, sans-serif",
 
                       fontSize: compact ? 13 : 15,
 
-                      fontWeight: 900,
+                      fontWeight: 800,
 
                       color: barColor,
 
@@ -1965,16 +2571,20 @@ function PollCard({
               </button>
             )
           })}
-        </div>
+          </div>
+        )}
 
         {showResults && poll.expired && (
           <div
-            className="results-pop"
             style={{
-              padding: compact ? "2px 14px 12px" : "4px 18px 14px",
+              padding: bareResults
+                ? "0 14px 12px"
+                : compact
+                  ? "2px 14px 12px"
+                  : "4px 18px 14px",
             }}
           >
-            <PollResults poll={poll} compact={compact} />
+            <PollResults poll={poll} compact={compact} bare={bareResults} />
           </div>
         )}
       </div>
@@ -2015,6 +2625,7 @@ function PollCard({
           <button
             onClick={() => onRedditVote(poll.id, "up")}
             title="Upvote"
+            className="press-pop"
             style={{
               background: "none",
 
@@ -2037,13 +2648,12 @@ function PollCard({
             ▲
           </button>
           <span
-            className="number-tick"
             style={{
               fontFamily: "Satoshi, sans-serif",
 
               fontSize: 13,
 
-              fontWeight: 900,
+              fontWeight: 800,
 
               color:
                 score > 0
@@ -2062,6 +2672,7 @@ function PollCard({
           <button
             onClick={() => onRedditVote(poll.id, "down")}
             title="Downvote"
+            className="press-pop"
             style={{
               background: "none",
 
@@ -2089,9 +2700,27 @@ function PollCard({
         <span
           style={{ color: "var(--text-faint)", fontSize: 12, fontWeight: 700 }}
         >
-          {poll.expired
-            ? "🏁 Closed · ended"
-            : `${total.toLocaleString()} votes`}
+          {poll.expired ? (
+            <span
+              style={{
+                display: "flex",
+
+                alignItems: "center",
+
+                gap: 4,
+              }}
+            >
+              <FlagIcon size={12} /> Closed · ended
+            </span>
+          ) : (
+            <>
+              <RollingNumber
+                value={total}
+                style={{ color: "var(--text-muted)" }}
+              />{" "}
+              votes
+            </>
+          )}
         </span>
         <button
           onClick={() => setShowComments(!showComments)}
@@ -2118,93 +2747,47 @@ function PollCard({
 
             gap: 5,
 
-            padding: "2px 0",
+            padding: isNarrow ? "9px 8px" : "2px 0",
 
             transition: "color 0.15s",
           }}
         >
-          💬{" "}
+          <ChatIcon size={14} />{" "}
           {poll.comments.length > 0
             ? `${poll.comments.length} comment${
                 poll.comments.length !== 1 ? "s" : ""
               }`
             : "comment"}
         </button>
-        <button
-          onClick={() => onShare(poll)}
-          title="Share this poll"
-          style={{
-            background: "none",
-
-            border: "none",
-
-            cursor: "pointer",
-
-            color: "var(--text-faint)",
-
-            fontSize: 12,
-
-            fontWeight: 800,
-
-            fontFamily: "Satoshi, sans-serif",
-
-            display: "flex",
-
-            alignItems: "center",
-
-            gap: 5,
-
-            padding: "2px 0",
-
-            transition: "color 0.15s",
-          }}
-        >
-          🔗 Share
-        </button>
-        <button
-          onClick={() => poll.expired && setShowResults(!showResults)}
-          disabled={!poll.expired}
-          title={
-            poll.expired
-              ? showResults
-                ? "Hide results"
-                : "Show final results"
-              : `Results unlock in ${remainH}h ${remainM}m`
-          }
-          style={{
-            background: "none",
-
-            border: "none",
-
-            cursor: poll.expired ? "pointer" : "default",
-
-            color: showResults
-              ? "var(--primary)"
-              : poll.expired
-                ? "var(--text-muted)"
-                : "var(--text-faint)",
-
-            fontSize: 12,
-
-            fontWeight: 800,
-
-            fontFamily: "Satoshi, sans-serif",
-
-            display: "flex",
-
-            alignItems: "center",
-
-            gap: 5,
-
-            padding: "2px 0",
-
-            opacity: poll.expired ? 1 : 0.7,
-
-            transition: "color 0.15s",
-          }}
-        >
-          {poll.expired ? "📊 Results" : "🔒 Results"}
-        </button>
+        {!bareResults && !compact && (
+          <button
+            onClick={() => onShare(poll)}
+            title="Share this poll"
+            style={{
+              background: "var(--primary-soft-bg)",
+              border: "1px solid var(--primary-soft)",
+              cursor: "pointer",
+              color: "var(--primary)",
+              fontSize: 12,
+              fontWeight: 800,
+              fontFamily: "Satoshi, sans-serif",
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              padding: isNarrow ? "9px 14px" : "4px 12px",
+              borderRadius: 99,
+              transition: "background 0.15s, transform 0.1s",
+            }}
+            onMouseEnter={(e) =>
+              (e.currentTarget.style.background = "var(--primary-soft)")
+            }
+            onMouseLeave={(e) =>
+              (e.currentTarget.style.background = "var(--primary-soft-bg)")
+            }
+          >
+            <LinkIcon size={14} /> Share
+          </button>
+        )}
         {isAdmin && onDelete && (
           <button
             onClick={() => onDelete(poll.id)}
@@ -2224,12 +2807,12 @@ function PollCard({
 
               fontFamily: "Satoshi, sans-serif",
 
-              padding: "2px 0",
+              padding: isNarrow ? "9px 8px" : "2px 0",
 
               transition: "color 0.15s",
             }}
           >
-            🗑️ Delete
+            <TrashIcon size={14} /> Delete
           </button>
         )}
       </div>
@@ -2270,6 +2853,8 @@ function PollCard({
                   fontSize: 13,
 
                   lineHeight: 1.55,
+
+                  overflowWrap: "anywhere",
                 }}
               >
                 {c.text}
@@ -2351,7 +2936,7 @@ function PollCard({
                 </button>
               </div>
 
-              {replyTo === c.id && (
+              {!bareResults && replyTo === c.id && (
                 <div
                   style={{
                     display: "flex",
@@ -2385,11 +2970,9 @@ function PollCard({
 
                       color: "var(--text)",
 
-                      fontSize: 12,
+                      fontSize: isNarrow ? 16 : 12,
 
                       fontFamily: "Satoshi, sans-serif",
-
-                      outline: "none",
                     }}
                   />
                   <button
@@ -2464,6 +3047,8 @@ function PollCard({
                           fontSize: 12,
 
                           lineHeight: 1.5,
+
+                          overflowWrap: "anywhere",
                         }}
                       >
                         {r.text}
@@ -2497,15 +3082,16 @@ function PollCard({
               )}
             </div>
           ))}
-          <div
-            style={{
-              display: "flex",
+          {!bareResults && (
+            <div
+              style={{
+                display: "flex",
 
-              gap: 7,
+                gap: 7,
 
-              marginTop: poll.comments.length ? 8 : 0,
-            }}
-          >
+                marginTop: poll.comments.length ? 8 : 0,
+              }}
+            >
             <input
               value={commentText}
               onChange={(e) => setCommentText(e.target.value)}
@@ -2525,11 +3111,9 @@ function PollCard({
 
                 color: "var(--text)",
 
-                fontSize: 13,
+                fontSize: isNarrow ? 16 : 13,
 
                 fontFamily: "Satoshi, sans-serif",
-
-                outline: "none",
               }}
             />
             <button
@@ -2561,7 +3145,8 @@ function PollCard({
             >
               Post
             </button>
-          </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -2585,11 +3170,12 @@ function SharedPollView({
 
   onComment: () => void
 }) {
-  const [voted, setVoted] = useState(poll.voted)
+  // Votes and the user's choice are derived from the parent's state (the
+  // parent guards the vote atomically), so a rapid double-tap can never
+  // double-count locally and re-renders always reflect the real values.
+  const votes = poll.options.map((_, i) => poll.votes[i] ?? 0)
 
-  const [votes, setVotes] = useState<number[]>(() =>
-    poll.options.map((_, i) => poll.votes[i] ?? 0),
-  )
+  const voted = poll.voted
 
   const [now, setNow] = useState(() => Date.now())
 
@@ -2607,16 +3193,6 @@ function SharedPollView({
 
   const castVote = (i: number) => {
     if (voted !== null) return
-
-    setVotes((prev) => {
-      const next = [...prev]
-
-      next[i] += 1
-
-      return next
-    })
-
-    setVoted(i)
 
     onVote(i)
   }
@@ -2643,8 +3219,6 @@ function SharedPollView({
           zIndex: 50,
 
           background: "var(--bg-92)",
-
-          backdropFilter: "blur(18px)",
 
           borderBottom: "1px solid var(--border)",
         }}
@@ -2793,8 +3367,19 @@ function SharedPollView({
                   border: `1px solid ${meta.border}`,
                 }}
               >
-                {meta.emoji} {poll.category}
+              <span
+                style={{
+                  display: "inline-flex",
+
+                  alignItems: "center",
+
+                  gap: 5,
+                }}
+              >
+                <CategoryIcon cat={poll.category} size={12} />
+                {poll.category}
               </span>
+            </span>
               <span
                 style={{
                   display: "inline-flex",
@@ -2841,6 +3426,8 @@ function SharedPollView({
                 margin: "0 0 14px",
 
                 lineHeight: 1.35,
+
+                overflowWrap: "anywhere",
               }}
             >
               {poll.question}
@@ -2917,17 +3504,13 @@ function SharedPollView({
                     }}
                   >
                     {didVote && (
-                      <div
+                      <AnimatedBar
+                        pct={pct}
+                        className={isVoted ? "vote-bar vote-bar-lit" : "vote-bar"}
                         style={{
                           position: "absolute",
-
                           inset: 0,
-
-                          width: `${pct}%`,
-
                           background: barBg,
-
-                          transition: "width 0.6s ease",
                         }}
                       />
                     )}
@@ -2965,13 +3548,13 @@ function SharedPollView({
                       </span>
                       {didVote ? (
                         <span
-                          className="number-tick"
+                          key={pct}
                           style={{
                             fontFamily: "Satoshi, sans-serif",
 
                             fontSize: 18,
 
-                            fontWeight: 900,
+                            fontWeight: 800,
 
                             color: barColor,
 
@@ -3049,7 +3632,7 @@ function SharedPollView({
                   padding: "2px 0",
                 }}
               >
-                💬 comment on this
+                <ChatIcon size={13} /> comment on this
               </button>
             </div>
           </div>
@@ -3075,142 +3658,216 @@ function SharedPollView({
   )
 }
 
-function useCountUp(target: number, duration = 900, start = true): number {
-  const [value, setValue] = useState(0)
+// Static percentage bar: width set directly from the value with no state,
+// effects, or transitions, so vote updates can never re-trigger renders or
+// animations on the feed.
+function AnimatedBar({
+  pct,
+  className,
+  style,
+}: {
+  pct: number
+  className?: string
+  style?: CSSProperties
+}) {
+  return (
+    <div
+      className={className}
+      style={{
+        width: `${Math.max(0, Math.min(100, pct))}%`,
+        ...style,
+      }}
+    />
+  )
+}
 
-  useEffect(() => {
-    if (!start) return
+// Odometer-style count: digits that changed since the last value roll in
+// smoothly, unchanged digits stay put.
+function RollingNumber({
+  value,
+  style,
+}: {
+  value: number
+  style?: CSSProperties
+}) {
+  const prevRef = useRef<number | null>(null)
 
-    let raf = 0
+  const prev = prevRef.current
 
-    const t0 = performance.now()
+  prevRef.current = value
 
-    const tick = (t: number) => {
-      const k = Math.min(1, (t - t0) / duration)
+  const str = String(Math.max(0, value))
 
-      const eased = 1 - Math.pow(1 - k, 3)
+  const prevStr = prev === null ? null : String(Math.max(0, prev))
 
-      setValue(Math.round(target * eased))
+  const n = Math.max(str.length, prevStr ? prevStr.length : 0)
 
-      if (k < 1) raf = requestAnimationFrame(tick)
-    }
+  const cur = str.padStart(n, "0")
 
-    raf = requestAnimationFrame(tick)
+  const old = prevStr ? prevStr.padStart(n, "0") : null
 
-    return () => cancelAnimationFrame(raf)
-  }, [start, target, duration])
+  const parts: { d: string; changed: boolean }[] = []
 
-  return value
+  for (let i = 0; i < n; i++) {
+    const ci = cur.length - 1 - i
+
+    const oi = old ? old.length - 1 - i : -1
+
+    parts.unshift({
+      d: cur[ci],
+      changed: old === null || oi < 0 || old[oi] !== cur[ci],
+    })
+  }
+
+  return (
+    <span
+      aria-label={str}
+      style={{
+        display: "inline-flex",
+        fontVariantNumeric: "tabular-nums",
+        ...style,
+      }}
+    >
+      {parts.map((p, i) => {
+        const sep = i !== 0 && (n - i) % 3 === 0
+
+        return (
+          <span key={i} style={{ display: "inline-flex" }}>
+            {sep && <span style={{ opacity: 0.55 }}>,</span>}
+            <span
+              key={p.d}
+              className={p.changed ? "digit-roll" : undefined}
+            >
+              {p.d}
+            </span>
+          </span>
+        )
+      })}
+    </span>
+  )
 }
 
 function ResultRow({
   color,
-
   label,
-
   votes,
-
   pct,
-
   crowned,
+  showCrown = true,
+  showBar = false,
+  active = false,
+  onHover,
+  wrap = false,
 }: {
   color: string
-
   label: string
-
   votes: number
-
   pct: number
-
   crowned: boolean
+  showCrown?: boolean
+  showBar?: boolean
+  active?: boolean
+  onHover?: (h: boolean) => void
+  wrap?: boolean
 }) {
-  const n = useCountUp(votes)
-
   return (
     <div
+      onMouseEnter={() => onHover?.(true)}
+      onMouseLeave={() => onHover?.(false)}
       style={{
         display: "flex",
-
-        alignItems: "center",
-
-        gap: 8,
-
+        flexDirection: "column",
+        gap: 5,
         padding: "7px 10px",
-
         borderRadius: 10,
-
-        background: crowned ? "var(--primary-soft-bg)" : "var(--surface)",
-
-        border: crowned
-          ? "1px solid var(--primary-soft)"
-          : "1px solid var(--border)",
+        background: active
+          ? "var(--surface-2)"
+          : crowned
+            ? "var(--primary-soft-bg)"
+            : "var(--surface)",
+        border: active
+          ? `1px solid ${color}`
+          : crowned
+            ? "1px solid var(--primary-soft)"
+            : "1px solid var(--border)",
+        cursor: "default",
       }}
     >
-      <span
+      <div
         style={{
-          width: 9,
-
-          height: 9,
-
-          borderRadius: "50%",
-
-          background: color,
-
-          flexShrink: 0,
-        }}
-      />
-      <span
-        style={{
-          flex: 1,
-
-          minWidth: 0,
-
-          overflow: "hidden",
-
-          textOverflow: "ellipsis",
-
-          whiteSpace: "nowrap",
-
-          color: "var(--text-muted)",
-
-          fontSize: 12,
-
-          fontWeight: 700,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
         }}
       >
-        {label}
-      </span>
-      <span
-        style={{
-          color: "var(--text)",
-
-          fontSize: 12,
-
-          fontWeight: 900,
-
-          fontVariantNumeric: "tabular-nums",
-        }}
-      >
-        {n.toLocaleString()}
-      </span>
-      <span
-        style={{
-          color: color,
-
-          fontSize: 12,
-
-          fontWeight: 900,
-
-          minWidth: 44,
-
-          textAlign: "right",
-
-          fontVariantNumeric: "tabular-nums",
-        }}
-      >
-        {pct}%
-      </span>
-      {crowned && <span title="Winner">👑</span>}
+        <span
+          style={{
+            width: 9,
+            height: 9,
+            borderRadius: "50%",
+            background: color,
+            flexShrink: 0,
+          }}
+        />
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            overflow: wrap ? "visible" : "hidden",
+            textOverflow: wrap ? "clip" : "ellipsis",
+            whiteSpace: wrap ? "normal" : "nowrap",
+            lineHeight: wrap ? 1.35 : undefined,
+            color: "var(--text-muted)",
+            fontSize: 12,
+            fontWeight: 700,
+          }}
+        >
+          {label}
+        </span>
+        <span
+          style={{
+            color: "var(--text)",
+            fontSize: 12,
+            fontWeight: 900,
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          <RollingNumber value={votes} />
+        </span>
+        <span
+          style={{
+            color: color,
+            fontSize: 12,
+            fontWeight: 900,
+            minWidth: 44,
+            textAlign: "right",
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          {pct}%
+        </span>
+        {showCrown && crowned && <span title="Winner">👑</span>}
+      </div>
+      {showBar && (
+        <div
+          style={{
+            height: 4,
+            borderRadius: 99,
+            background: "var(--surface-2)",
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              height: "100%",
+              width: `${pct}%`,
+              borderRadius: 99,
+              background: color,
+              opacity: 0.85,
+            }}
+          />
+        </div>
+      )}
     </div>
   )
 }
@@ -3219,12 +3876,20 @@ function PollResults({
   poll,
 
   compact = false,
+
+  bare = false,
 }: {
   poll: Poll
 
   compact?: boolean
+
+  bare?: boolean
 }) {
   const [mounted, setMounted] = useState(false)
+
+  const [hovered, setHovered] = useState<number | null>(null)
+
+  const isNarrow = useIsNarrow()
 
   useEffect(() => {
     const raf = requestAnimationFrame(() => setMounted(true))
@@ -3242,7 +3907,7 @@ function PollResults({
 
     .filter((i) => i >= 0)
 
-  const centerTotal = useCountUp(total)
+  const centerTotal = useMemo(() => hovered !== null ? (poll.votes[hovered] ?? 0) : total, [hovered, poll.votes, total])
 
   const R = 40
 
@@ -3277,74 +3942,80 @@ function PollResults({
 
   const winPct = winners.length === 1 ? pctOf(winners[0]) : 0
 
+  const donutSize = bare ? (compact ? 96 : 118) : compact ? 150 : 170
+
+  const strokeW = bare ? 10 : 13
+
   return (
     <div>
-      <div
-        style={{
-          display: "flex",
-
-          alignItems: "center",
-
-          gap: 8,
-
-          flexWrap: "wrap",
-
-          marginBottom: 12,
-        }}
-      >
-        <span
+      {!bare && (
+        <div
           style={{
-            fontSize: 10,
+            display: "flex",
 
-            fontWeight: 900,
+            alignItems: "center",
 
-            letterSpacing: "0.08em",
+            gap: 8,
 
-            textTransform: "uppercase",
+            flexWrap: "wrap",
 
-            color: "var(--text-faint)",
+            marginBottom: 12,
           }}
         >
-          🏁 Final results
-        </span>
-        {winners.length === 1 ? (
           <span
             style={{
-              fontSize: 12,
+              fontSize: 10,
 
               fontWeight: 900,
 
-              color: "var(--primary)",
-            }}
-          >
-            {poll.options[winners[0]]} won with {winPct}% 👑
-          </span>
-        ) : winners.length > 1 ? (
-          <span
-            style={{
-              fontSize: 12,
+              letterSpacing: "0.08em",
 
-              fontWeight: 900,
-
-              color: "var(--text-dim)",
-            }}
-          >
-            🤝 It's a tie!
-          </span>
-        ) : (
-          <span
-            style={{
-              fontSize: 12,
-
-              fontWeight: 800,
+              textTransform: "uppercase",
 
               color: "var(--text-faint)",
             }}
           >
-            No votes cast
+            🏁 Final results
           </span>
-        )}
-      </div>
+          {winners.length === 1 ? (
+            <span
+              style={{
+                fontSize: 12,
+
+                fontWeight: 900,
+
+                color: "var(--primary)",
+              }}
+            >
+              {poll.options[winners[0]]} won with {winPct}% 👑
+            </span>
+          ) : winners.length > 1 ? (
+            <span
+              style={{
+                fontSize: 12,
+
+                fontWeight: 900,
+
+                color: "var(--text-dim)",
+              }}
+            >
+              🤝 It's a tie!
+            </span>
+          ) : (
+            <span
+              style={{
+                fontSize: 12,
+
+                fontWeight: 800,
+
+                color: "var(--text-faint)",
+              }}
+            >
+              No votes cast
+            </span>
+          )}
+        </div>
+      )}
 
       <div
         style={{
@@ -3352,7 +4023,9 @@ function PollResults({
 
           alignItems: "center",
 
-          gap: 16,
+          flexDirection: bare ? "column" : "row",
+
+          gap: bare ? 12 : 16,
 
           flexWrap: "wrap",
         }}
@@ -3360,8 +4033,8 @@ function PollResults({
         <div style={{ position: "relative", flexShrink: 0 }}>
           <svg
             viewBox="0 0 100 100"
-            width={compact ? 150 : 170}
-            height={compact ? 150 : 170}
+            width={donutSize}
+            height={donutSize}
             style={{ transform: "rotate(-90deg)", display: "block" }}
           >
             <circle
@@ -3370,7 +4043,7 @@ function PollResults({
               r={R}
               fill="none"
               stroke="var(--surface-2)"
-              strokeWidth={13}
+              strokeWidth={strokeW}
             />
             {segments.map((s) => (
               <circle
@@ -3385,10 +4058,22 @@ function PollResults({
                 r={R}
                 fill="none"
                 stroke={s.color}
-                strokeWidth={13}
+                strokeWidth={
+                  hovered === s.i ? strokeW + 4 : strokeW
+                }
                 strokeDasharray={`${mounted ? s.len : 0} ${C}`}
                 strokeDashoffset={-s.offset}
-                style={{ transitionDelay: `${s.i * 0.12}s` }}
+                opacity={
+                  hovered === null || hovered === s.i ? 1 : 0.28
+                }
+                style={{
+                  transitionDelay: `${
+                    hovered === null ? s.i * 0.12 : 0
+                  }s`,
+                  cursor: "pointer",
+                }}
+                onMouseEnter={() => setHovered(s.i)}
+                onMouseLeave={() => setHovered(null)}
               />
             ))}
           </svg>
@@ -3411,7 +4096,7 @@ function PollResults({
               gap: 1,
             }}
           >
-            {total > 0 && (
+            {!bare && total > 0 && (
               <span style={{ fontSize: 16, lineHeight: 1 }}>
                 {winners.length > 1 ? "🤝" : "👑"}
               </span>
@@ -3420,7 +4105,7 @@ function PollResults({
               style={{
                 fontFamily: "Satoshi, sans-serif",
 
-                fontSize: compact ? 22 : 26,
+                fontSize: bare ? 20 : compact ? 22 : 26,
 
                 fontWeight: 900,
 
@@ -3431,23 +4116,30 @@ function PollResults({
                 fontVariantNumeric: "tabular-nums",
               }}
             >
-              {centerTotal.toLocaleString()}
+              <RollingNumber value={centerTotal} />
             </span>
-            <span
-              style={{
-                fontSize: 10,
-
-                fontWeight: 800,
-
-                color: "var(--text-faint)",
-
-                letterSpacing: "0.06em",
-
-                textTransform: "uppercase",
-              }}
-            >
-              {total === 1 ? "vote" : "votes"}
-            </span>
+            {!isNarrow && (
+              <span
+                style={{
+                  fontSize: 10,
+                  fontWeight: 800,
+                  color: hovered !== null ? "var(--primary)" : "var(--text-faint)",
+                  letterSpacing: "0.06em",
+                  textTransform: "uppercase",
+                  maxWidth: donutSize - 24,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  transition: "color 0.2s",
+                }}
+              >
+                {hovered !== null
+                  ? poll.options[hovered]
+                  : total === 1
+                    ? "vote"
+                    : "votes"}
+              </span>
+            )}
           </div>
         </div>
 
@@ -3455,13 +4147,15 @@ function PollResults({
           style={{
             flex: 1,
 
-            minWidth: 200,
+            width: bare ? "100%" : undefined,
+
+            minWidth: bare ? 0 : 200,
 
             display: "grid",
 
-            gridTemplateColumns: compact ? "1fr" : "1fr 1fr",
+            gridTemplateColumns: bare ? "1fr" : compact ? "1fr" : "1fr 1fr",
 
-            gap: 7,
+            gap: bare ? 6 : 7,
           }}
         >
           {poll.options.map((label, i) => (
@@ -3472,296 +4166,14 @@ function PollResults({
               votes={poll.votes[i] ?? 0}
               pct={pctOf(i)}
               crowned={winners.includes(i)}
+              showCrown={!bare}
+              showBar={bare}
+              active={hovered === i}
+              onHover={(h) => setHovered(h ? i : null)}
+              wrap={isNarrow || bare}
             />
           ))}
         </div>
-      </div>
-    </div>
-  )
-}
-
-function ArchiveTable({
-  polls,
-
-  onDelete,
-}: {
-  polls: Poll[]
-
-  onDelete?: (p: Poll) => void
-}) {
-  const fmtDate = (ts: number) =>
-    new Date(ts).toLocaleString(undefined, {
-      day: "numeric",
-
-      month: "short",
-
-      year: "numeric",
-
-      hour: "2-digit",
-
-      minute: "2-digit",
-    })
-
-  if (polls.length === 0) {
-    return (
-      <div
-        style={{
-          textAlign: "center",
-
-          padding: "60px 0",
-
-          color: "var(--text-faint)",
-        }}
-      >
-        <p style={{ fontSize: 36, margin: "0 0 8px" }}>🗃️</p>
-        <p
-          style={{
-            fontFamily: "Satoshi, sans-serif",
-
-            fontSize: 18,
-
-            fontWeight: 700,
-
-            margin: "0 0 4px",
-
-            color: "var(--text-dim)",
-          }}
-        >
-          No archived polls yet
-        </p>
-        <p style={{ fontSize: 13, margin: 0, fontWeight: 600 }}>
-          Closed polls will show up here for the admin.
-        </p>
-      </div>
-    )
-  }
-
-  const totalVotes = polls.reduce(
-    (s, p) => s + p.votes.reduce((a, v) => a + v, 0),
-
-    0,
-  )
-
-  const top = [...polls].sort(
-    (a, b) =>
-      b.votes.reduce((s, v) => s + v, 0) - a.votes.reduce((s, v) => s + v, 0),
-  )[0]
-
-  const topVotes = top.votes.reduce((s, v) => s + v, 0)
-
-  const chip = {
-    display: "inline-flex",
-
-    alignItems: "center",
-
-    gap: 6,
-
-    background: "var(--surface)",
-
-    border: "1px solid var(--border)",
-
-    borderRadius: 99,
-
-    padding: "6px 13px",
-
-    fontSize: 12,
-
-    fontWeight: 800,
-
-    color: "var(--text-dim)",
-  } as const
-
-  const th = {
-    padding: "9px 12px",
-
-    textAlign: "left",
-
-    whiteSpace: "nowrap",
-
-    fontWeight: 800,
-
-    letterSpacing: "0.07em",
-
-    color: "var(--text-faint)",
-
-    fontSize: 10,
-
-    textTransform: "uppercase",
-  } as const
-
-  const td = {
-    padding: "10px 12px",
-
-    whiteSpace: "nowrap",
-
-    color: "var(--text-dim)",
-
-    fontWeight: 700,
-
-    fontSize: 12.5,
-  } as const
-
-  return (
-    <div>
-      <div
-        style={{
-          display: "flex",
-
-          flexWrap: "wrap",
-
-          gap: 8,
-
-          marginBottom: 14,
-        }}
-      >
-        <span style={chip}>🗃️ {polls.length} archived</span>
-        <span style={chip}>🗳️ {totalVotes} votes cast</span>
-        <span style={chip}>
-          🏆{" "}
-          <span
-            style={{
-              maxWidth: 240,
-
-              whiteSpace: "nowrap",
-
-              overflow: "hidden",
-
-              textOverflow: "ellipsis",
-            }}
-          >
-            {top.question} — {topVotes} vote{topVotes !== 1 ? "s" : ""}
-          </span>
-        </span>
-      </div>
-
-      <div
-        style={{
-          overflowX: "auto",
-
-          border: "1px solid var(--border)",
-
-          borderRadius: 14,
-
-          background: "var(--surface)",
-        }}
-      >
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr>
-              <th style={th}>Closed</th>
-              <th style={th}>Question</th>
-              <th style={th}>Category</th>
-              <th style={th}>Duration</th>
-              <th style={th}>Votes</th>
-              <th style={th}>▲/▼</th>
-              <th style={th}>💬</th>
-              <th style={th}>Author</th>
-              {onDelete && <th style={th} />}
-            </tr>
-          </thead>
-          <tbody>
-            {polls.map((p) => {
-              const votes = p.votes.reduce((s, v) => s + v, 0)
-
-              const meta = categoryMeta(p.category)
-
-              return (
-                <tr
-                  key={p.id}
-                  style={{
-                    borderTop: "1px solid var(--border)",
-
-                    background: "transparent",
-                  }}
-                >
-                  <td style={td}>{fmtDate(p.createdAt + pollLifetimeMs(p))}</td>
-                  <td style={{ ...td, maxWidth: 300 }}>
-                    <span
-                      style={{
-                        display: "block",
-
-                        fontWeight: 800,
-
-                        color: "var(--text)",
-
-                        maxWidth: 300,
-
-                        whiteSpace: "nowrap",
-
-                        overflow: "hidden",
-
-                        textOverflow: "ellipsis",
-                      }}
-                    >
-                      {p.question}
-                    </span>
-                    <span
-                      style={{
-                        fontSize: 10.5,
-
-                        color: "var(--text-faint)",
-
-                        fontWeight: 600,
-                      }}
-                    >
-                      created {fmtDate(p.createdAt)}
-                    </span>
-                  </td>
-                  <td style={td}>
-                    {meta ? `${meta.emoji} ${p.category}` : p.category}
-                  </td>
-                  <td style={td}>{p.durationH ?? 48}h</td>
-                  <td
-                    style={{
-                      ...td,
-
-                      color: "var(--primary)",
-
-                      fontWeight: 900,
-                    }}
-                  >
-                    {votes}
-                  </td>
-                  <td style={td}>
-                    <span style={{ color: "var(--primary)" }}>
-                      ▲ {p.upvotes}
-                    </span>{" "}
-                    <span style={{ color: "var(--accent)" }}>
-                      ▼ {p.downvotes}
-                    </span>
-                  </td>
-                  <td style={td}>{p.comments.length}</td>
-                  <td style={td}>{p.author}</td>
-                  {onDelete && (
-                    <td style={{ ...td, textAlign: "right" }}>
-                      <button
-                        onClick={() => onDelete(p)}
-                        title="Delete this poll"
-                        style={{
-                          background: "none",
-
-                          border: "none",
-
-                          padding: "4px 6px",
-
-                          cursor: "pointer",
-
-                          fontSize: 13,
-
-                          color: "var(--text-faint)",
-
-                          transition: "all 0.15s",
-                        }}
-                      >
-                        🗑️
-                      </button>
-                    </td>
-                  )}
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
       </div>
     </div>
   )
@@ -4121,6 +4533,8 @@ function NewPollModal({
     p: Omit<Poll, "id" | "votes" | "voted" | "comments" | "timeAgo" | "hot" | "createdAt" | "upvotes" | "downvotes" | "userVote">,
   ) => void
 }) {
+  const isNarrow = useIsNarrow()
+
   const [question, setQuestion] = useState("")
 
   const [description, setDescription] = useState("")
@@ -4139,10 +4553,14 @@ function NewPollModal({
 
   const filledOptions = options.map((o) => o.trim()).filter((o) => o !== "")
 
+  const hasDuplicates = new Set(filledOptions.map((o) => o.toLowerCase())).size !==
+    filledOptions.length
+
   const valid =
     question.trim() !== "" &&
     author.trim() !== "" &&
     filledOptions.length >= MIN_OPTIONS &&
+    !hasDuplicates &&
     (!customOpen || category.trim() !== "")
 
   const updateOption = (i: number, value: string) =>
@@ -4221,9 +4639,16 @@ function NewPollModal({
             color: "var(--text)",
 
             margin: "0 0 18px",
+
+            display: "flex",
+
+            alignItems: "center",
+
+            gap: 8,
           }}
         >
-          Start a Poll 🌱
+          <SproutIcon size={19} />
+          Start a Poll
         </h2>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 13 }}>
@@ -4266,16 +4691,15 @@ function NewPollModal({
 
                   color: "var(--text)",
 
-                  fontSize: 13,
+                  fontSize: isNarrow ? 16 : 13,
 
                   fontFamily: "Satoshi, sans-serif",
-
-                  outline: "none",
                 }}
               />
               <button
                 onClick={shuffleName}
                 title="Random name"
+                className="press-pop"
                 style={{
                   background: "var(--surface-2)",
 
@@ -4342,11 +4766,9 @@ function NewPollModal({
 
                 color: "var(--text)",
 
-                fontSize: 14,
+                fontSize: isNarrow ? 16 : 14,
 
                 fontFamily: "Satoshi, sans-serif",
-
-                outline: "none",
 
                 resize: "none",
               }}
@@ -4403,11 +4825,9 @@ function NewPollModal({
 
                 color: "var(--text)",
 
-                fontSize: 14,
+                fontSize: isNarrow ? 16 : 14,
 
                 fontFamily: "Satoshi, sans-serif",
-
-                outline: "none",
 
                 resize: "none",
               }}
@@ -4485,8 +4905,6 @@ function NewPollModal({
                         fontSize: 13,
 
                         fontFamily: "Satoshi, sans-serif",
-
-                        outline: "none",
                       }}
                     />
                   </div>
@@ -4555,6 +4973,22 @@ function NewPollModal({
             </button>
           )}
 
+          {hasDuplicates && (
+            <p
+              style={{
+                margin: 0,
+
+                fontSize: 12,
+
+                fontWeight: 700,
+
+                color: "#e05d5d",
+              }}
+            >
+              Options must be different — two choices read the same.
+            </p>
+          )}
+
           <div>
             <label
               style={{
@@ -4608,7 +5042,18 @@ function NewPollModal({
                       transition: "all 0.15s",
                     }}
                   >
-                    {m.emoji} {cat}
+                    <span
+                      style={{
+                        display: "inline-flex",
+
+                        alignItems: "center",
+
+                        gap: 5,
+                      }}
+                    >
+                      <CategoryIcon cat={cat} size={12} />
+                      {cat}
+                    </span>
                   </button>
                 )
               })}
@@ -4664,11 +5109,9 @@ function NewPollModal({
 
                   color: "var(--text)",
 
-                  fontSize: 13,
+                  fontSize: isNarrow ? 16 : 13,
 
                   fontFamily: "Satoshi, sans-serif",
-
-                  outline: "none",
                 }}
               />
             )}
@@ -4715,12 +5158,14 @@ function NewPollModal({
                     onClick={() => setDurationH(h)}
                     style={{
                       background: active
-                        ? "var(--gradient)"
+                        ? "var(--primary-soft-bg)"
                         : "var(--surface-2)",
 
-                      color: active ? "#fff" : "var(--text-dim)",
+                      color: active ? "var(--primary)" : "var(--text-dim)",
 
-                      border: active ? "none" : "1px solid var(--border)",
+                      border: active
+                        ? "1px solid var(--primary-soft)"
+                        : "1px solid var(--border)",
 
                       borderRadius: 99,
 
@@ -4774,7 +5219,11 @@ function NewPollModal({
             <button
               onClick={() => {
                 if (valid) {
-                  localStorage.setItem("bageecha-author", author.trim())
+                  try {
+                    localStorage.setItem("bageecha-author", author.trim())
+                  } catch {
+                    /* storage unavailable — nothing to persist */
+                  }
 
                   onSubmit({
                     question: question.trim(),
@@ -4838,7 +5287,11 @@ export default function App() {
     if (!id) {
       id = `anon_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 
-      localStorage.setItem("bageecha-anon-id", id)
+      try {
+        localStorage.setItem("bageecha-anon-id", id)
+      } catch {
+        /* storage unavailable — keep the id in memory only */
+      }
     }
 
     return id
@@ -4847,6 +5300,20 @@ export default function App() {
   const [rawPolls, setRawPolls] = useState<RawPoll[]>([])
 
   const [archiveRawPolls, setArchiveRawPolls] = useState<RawPoll[]>([])
+
+  // Paginated tail: docs older than the live snapshot window, fetched on
+  // demand. Never replaced by snapshots — only merged, deduped by id.
+  const [olderPolls, setOlderPolls] = useState<RawPoll[]>([])
+
+  const [olderArchivePolls, setOlderArchivePolls] = useState<RawPoll[]>([])
+
+  const [hasMore, setHasMore] = useState(false)
+
+  const [loadingMore, setLoadingMore] = useState(false)
+
+  const [archiveHasMore, setArchiveHasMore] = useState(false)
+
+  const [archiveLoadingMore, setArchiveLoadingMore] = useState(false)
 
   const [profile, setProfile] = useState<ProfileMap>(() => {
     try {
@@ -4902,7 +5369,7 @@ export default function App() {
 
       options: data.options ?? [],
 
-      votes: data.votes ?? (data.options ?? []).map(() => 0),
+      votes: (data.options ?? []).map((_, i) => data.votes?.[i] ?? 0),
 
       voted: null,
 
@@ -4943,19 +5410,43 @@ export default function App() {
   const searchQRef = useRef<string[]>([])
 
   const [sort, setSort] =
-    useState<"trending" | "popular" | "newest" | "mostVoted">("popular")
+    useState<"trending" | "popular" | "newest" | "mostVoted">("newest")
 
-  const [view, setView] = useState<"list" | "grid">("list")
+  const [archiveSort, setArchiveSort] = useState<"newest" | "mostVoted">(
+    "newest",
+  )
+
+  const [view, setView] = useState<"list" | "grid">(
+    () => (window.innerWidth < 640 ? "list" : "grid"),
+  )
 
   const [liveCount, setLiveCount] = useState(1)
 
   const [theme, setTheme] = useState(
-    () => localStorage.getItem("bageecha-theme") || "graphite",
+    () => localStorage.getItem("bageecha-theme") || "ocean",
   )
 
   const [ctaIndex, setCtaIndex] = useState(() =>
     Math.floor(Math.random() * CTA_PHRASES.length),
   )
+
+  const [ripples, setRipples] = useState<
+    { id: number; x: number; y: number }[]
+  >([])
+
+  const rippleSeq = useRef(0)
+
+  const ctaFollowerRef = useRef<HTMLDivElement>(null)
+
+  const addCtaRipple = (x: number, y: number) => {
+    const id = ++rippleSeq.current
+
+    setRipples((r) => [...r, { id, x, y }])
+
+    window.setTimeout(() => {
+      setRipples((r) => r.filter((p) => p.id !== id))
+    }, 700)
+  }
 
   const [toast, setToast] = useState<string | null>(null)
 
@@ -4965,13 +5456,56 @@ export default function App() {
 
   const chromeRef = useRef<HTMLDivElement>(null)
 
-  const chromeH = useRef(0)
+  const [chromeHidden, setChromeHidden] = useState(false)
+
+  const feedSeenRef = useRef<Set<string>>(new Set())
+
+  const feedSnapKeyRef = useRef("")
+
+  const archiveSnapKeyRef = useRef("")
+
+  const bootedRef = useRef(false)
+
+  // Pagination cursors and guards (authoritative flags live in refs so
+  // snapshot callbacks and async loads never read stale state).
+  const feedCursorRef = useRef<QueryDocumentSnapshot | null>(null)
+
+  const feedHasMoreRef = useRef(false)
+
+  const feedFetchCountRef = useRef(0)
+
+  const feedLoadedRef = useRef(false)
+
+  const feedPrevWindowRef = useRef<Set<string>>(new Set())
+
+  const archiveCursorRef = useRef<QueryDocumentSnapshot | null>(null)
+
+  const archiveHasMoreRef = useRef(false)
+
+  const archiveLoadedRef = useRef(false)
+
+  const archivePrevWindowRef = useRef<Set<string>>(new Set())
+
+  const sentinelRef = useRef<HTMLDivElement>(null)
 
   const isAdmin = user?.email === ADMIN_EMAIL
 
-  const archiveView = isAdmin && showArchive
+  const archiveView = showArchive
 
   const toastTimer = useRef(0)
+
+  // In-flight action guards: state updates are async, so two rapid clicks
+  // (or Enter presses) within the same frame would otherwise double-apply
+  // votes/likes/comments against stale closure state.
+  const votePendingRef = useRef<Set<string>>(new Set())
+
+  const redditVotePendingRef = useRef<Set<string>>(new Set())
+
+  const likePendingRef = useRef<Set<string>>(new Set())
+
+  const commentPendingRef = useRef<Set<string>>(new Set())
+
+  const replyPendingRef = useRef<Set<string>>(new Set())
 
   const showToast = (msg: string, ms = 2200) => {
     setToast(msg)
@@ -4981,16 +5515,34 @@ export default function App() {
     toastTimer.current = window.setTimeout(() => setToast(null), ms)
   }
 
-  const polls = useMemo(
-    () => rawPolls.map((d) => toViewPoll(d, anonId, profile, now)),
+  const allRawPolls = useMemo(
+    () => mergeRawById(rawPolls, olderPolls),
 
-    [rawPolls, profile, anonId, now],
+    [rawPolls, olderPolls],
+  )
+
+  const allArchiveRawPolls = useMemo(
+    () => mergeRawById(archiveRawPolls, olderArchivePolls),
+
+    [archiveRawPolls, olderArchivePolls],
+  )
+
+  const polls = useMemo(
+    () => allRawPolls.map((d) => toViewPoll(d, anonId, profile, now)),
+
+    [allRawPolls, profile, anonId, now],
   )
 
   const archivePolls = useMemo(
-    () => archiveRawPolls.map((d) => toViewPoll(d, anonId, profile, now)),
+    () => allArchiveRawPolls.map((d) => toViewPoll(d, anonId, profile, now)),
 
-    [archiveRawPolls, profile, anonId, now],
+    [allArchiveRawPolls, profile, anonId, now],
+  )
+
+  const archiveClosed = useMemo(
+    () => archivePolls.filter((p) => p.expired),
+
+    [archivePolls],
   )
 
   const filters = useMemo(() => {
@@ -5001,7 +5553,7 @@ export default function App() {
     }
 
     const extra: FilterOption[] = [...custom].map((c) => ({
-      label: `${categoryMeta(c).emoji} ${c}`,
+      label: c,
 
       value: c,
     }))
@@ -5009,13 +5561,30 @@ export default function App() {
     return [...ALL_FILTERS, ...extra]
   }, [polls])
 
-  const patchRaw = (id: string, fn: (p: RawPoll) => RawPoll) =>
-    setRawPolls((prev) => prev.map((p) => (p.id === id ? fn(p) : p)))
+  const patchRaw = (id: string, fn: (p: RawPoll) => RawPoll) => {
+    const patch = (prev: RawPoll[]) =>
+      prev.map((p) => (p.id === id ? fn(p) : p))
+
+    // Patch every list a poll can render from (live window, paginated
+    // tails, archive) so optimistic updates show instantly everywhere
+    // and stay consistent when the poll shifts between lists.
+    setRawPolls(patch)
+
+    setOlderPolls(patch)
+
+    setArchiveRawPolls(patch)
+
+    setOlderArchivePolls(patch)
+  }
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme)
 
-    localStorage.setItem("bageecha-theme", theme)
+    try {
+      localStorage.setItem("bageecha-theme", theme)
+    } catch {
+      /* storage unavailable */
+    }
   }, [theme])
 
   useEffect(() => {
@@ -5093,7 +5662,11 @@ export default function App() {
   }, [filterOpen])
 
   useEffect(() => {
-    localStorage.setItem("bageecha-profile", JSON.stringify(profile))
+    try {
+      localStorage.setItem("bageecha-profile", JSON.stringify(profile))
+    } catch {
+      /* storage unavailable — votes just won't persist across reloads */
+    }
   }, [profile])
 
   useEffect(() => {
@@ -5138,7 +5711,36 @@ export default function App() {
         const docs = snap.docs.map((d) => d.data() as RawPoll)
 
         if (docs.length > 0) {
-          setRawPolls(docs)
+          // Only touch state when the snapshot data actually changed:
+          // Firestore re-fires on metadata-only events (local writes,
+          // connectivity) with identical data, and replacing the whole
+          // polls array with fresh references on every event re-renders
+          // every card and re-runs sorting endlessly.
+          const key = docs.map((d) => JSON.stringify(d)).join("|")
+
+          if (key !== feedSnapKeyRef.current) {
+            feedSnapKeyRef.current = key
+
+            setRawPolls(docs)
+
+            // A doc that left the live window was either pushed out by new
+            // arrivals (still exists — keep it visible) or deleted (drop it).
+            absorbWindowShift(feedPrevWindowRef, docs, setOlderPolls)
+          }
+
+          // First real data: anchor the pagination cursor to the window's
+          // oldest doc and advertise more pages if the window is full.
+          if (!feedLoadedRef.current) {
+            feedLoadedRef.current = true
+
+            feedCursorRef.current = snap.docs[snap.docs.length - 1] ?? null
+          }
+
+          if (snap.docs.length === 60 && feedFetchCountRef.current < 9) {
+            feedHasMoreRef.current = true
+
+            setHasMore(true)
+          }
 
           return
         }
@@ -5234,27 +5836,85 @@ export default function App() {
     return () => unsub()
   }, [])
 
-  // Admin-only: full collection for the archive view. Subscribes only while
-
-  // signed in as admin so visitors never download the whole database.
+  // Recent polls for the archive view — everyone can see closed polls. The
+  // live window is the newest 50; older pages load on demand via cursor
+  // pagination (a where+orderBy composite index isn't available, so
+  // expired-but-archived polls are filtered client-side by `p.expired`).
 
   useEffect(() => {
-    if (!isAdmin) return
-
-    const q = query(collection(db, "polls"))
+    const q = query(
+      collection(db, "polls"),
+      orderBy("createdAt", "desc"),
+      limit(50),
+    )
 
     const unsub = onSnapshot(
       q,
 
       (snap) => {
-        setArchiveRawPolls(snap.docs.map((d) => d.data() as RawPoll))
+        const docs = snap.docs.map((d) => d.data() as RawPoll)
+
+        const key = docs.map((d) => JSON.stringify(d)).join("|")
+
+        if (key !== archiveSnapKeyRef.current) {
+          archiveSnapKeyRef.current = key
+
+          setArchiveRawPolls(docs)
+
+          absorbWindowShift(archivePrevWindowRef, docs, setOlderArchivePolls)
+        }
+
+        if (!archiveLoadedRef.current) {
+          archiveLoadedRef.current = true
+
+          archiveCursorRef.current = snap.docs[snap.docs.length - 1] ?? null
+        }
+
+        if (snap.docs.length === 50 && !archiveHasMoreRef.current) {
+          archiveHasMoreRef.current = true
+
+          setArchiveHasMore(true)
+        }
       },
 
       (err) => console.error("Archive sync failed", err),
     )
 
     return () => unsub()
-  }, [isAdmin])
+  }, [])
+
+  // Auto-archive: polls past their lifetime leave the feed and become
+  // available in the archive. Runs on mount, whenever a poll list changes,
+  // and on a minute timer (a poll can expire mid-session with no new
+  // snapshot event to trigger the check); the write is idempotent. Both the
+  // feed window and the archive window are scanned so polls ranked 51–60
+  // (present only in the feed) still get archived.
+
+  const runAutoArchive = () => {
+    const candidates = allRawPolls.concat(allArchiveRawPolls)
+
+    if (candidates.length === 0) return
+
+    const toArchive = candidates.filter(
+      (d) => !d.archived && Date.now() - d.createdAt > pollLifetimeMs(d),
+    )
+
+    if (toArchive.length === 0) return
+
+    const batch = writeBatch(db)
+
+    toArchive.forEach((d) => batch.update(doc(db, "polls", d.id), { archived: true }))
+
+    batch.commit().catch((err) => console.error("Auto-archive failed", err))
+  }
+
+  useEffect(() => {
+    runAutoArchive()
+
+    const iv = setInterval(runAutoArchive, 60000)
+
+    return () => clearInterval(iv)
+  }, [allRawPolls, allArchiveRawPolls])
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => setUser(u))
@@ -5295,18 +5955,6 @@ export default function App() {
     setWelcomeOpen(true)
   }, [])
 
-  useEffect(() => {
-    const measure = () => {
-      if (chromeRef.current) chromeH.current = chromeRef.current.offsetHeight
-    }
-
-    measure()
-
-    window.addEventListener("resize", measure)
-
-    return () => window.removeEventListener("resize", measure)
-  }, [view, isNarrow])
-
   // Lock page scroll while a modal/overlay is open so wheel and touch input
 
   // stay inside the dialog instead of scrolling the feed behind it.
@@ -5337,69 +5985,121 @@ export default function App() {
   // no work (and no jank) while the page is idle.
 
   useEffect(() => {
-    const chrome = chromeRef.current
-
-    if (!chrome) return
-
-    chrome.style.transform = "translate3d(0, 0, 0)"
-
-    let current = 0
-
-    let target = 0
-
-    let raf = 0
-
-    const render = () => {
-      raf = 0
-
-      current += (target - current) * 0.28
-
-      if (Math.abs(target - current) < 0.4) current = target
-
-      chrome.style.transform = `translate3d(0, ${-current}px, 0)`
-
-      if (Math.abs(target - current) >= 0.4) {
-        raf = requestAnimationFrame(render)
-      }
-    }
-
     const onScroll = () => {
-      target = Math.max(0, Math.min(window.scrollY, chromeH.current || 1))
-
-      if (!raf) raf = requestAnimationFrame(render)
+      if (window.scrollY > 24) setChromeHidden(true)
+      else if (window.scrollY < 12) setChromeHidden(false)
     }
 
     window.addEventListener("scroll", onScroll, { passive: true })
 
-    return () => {
-      window.removeEventListener("scroll", onScroll)
+    return () => window.removeEventListener("scroll", onScroll)
+  }, [])
 
-      if (raf) cancelAnimationFrame(raf)
+  // Sync the collapsed state on mount and on layout changes so a reload at a
+  // scrolled position starts already hidden instead of animating from the top.
+  useLayoutEffect(() => {
+    // Functional update: if the value is unchanged React bails out, so this
+    // effect can never contribute to a render loop.
+    setChromeHidden((prev) =>
+      prev === (window.scrollY > 24) ? prev : window.scrollY > 24,
+    )
+  }, [view, isNarrow])
+
+  useEffect(() => {
+    let disposed = false
+    let source: EventSource | null = null
+    let attempts = 0
+    let fallbackTimer: number | undefined
+    let connectTimer: number | undefined
+    let firstCountTimer: number | undefined
+
+    const startFallback = () => {
+      if (disposed || fallbackTimer !== undefined) return
+
+      const pick = () => setLiveCount(Math.floor(Math.random() * 50) + 1)
+
+      pick()
+
+      fallbackTimer = window.setInterval(pick, 20000)
+    }
+
+    const connect = () => {
+      if (disposed) return
+
+      source = new EventSource(`${import.meta.env.BASE_URL}api/online`)
+
+      firstCountTimer = window.setTimeout(() => {
+        // No count arrived in time: this origin has no SSE endpoint
+        // (e.g. static hosting), so fall back to the jitter counter.
+        source?.close()
+
+        startFallback()
+      }, 5000)
+
+      source.addEventListener("message", (ev) => {
+        try {
+          const data = JSON.parse(ev.data) as { count?: unknown }
+
+          if (typeof data.count === "number" && data.count > 0) {
+            window.clearTimeout(firstCountTimer)
+
+            window.clearInterval(fallbackTimer)
+
+            attempts = 0
+
+            setLiveCount(data.count)
+          }
+        } catch {
+          /* malformed payload */
+        }
+      })
+
+      source.addEventListener("error", () => {
+        window.clearTimeout(firstCountTimer)
+
+        source?.close()
+
+        attempts += 1
+
+        if (attempts >= 3) {
+          startFallback()
+        } else {
+          connectTimer = window.setTimeout(connect, attempts * 3000)
+        }
+      })
+    }
+
+    connect()
+
+    return () => {
+      disposed = true
+
+      window.clearTimeout(firstCountTimer)
+
+      window.clearTimeout(connectTimer)
+
+      window.clearInterval(fallbackTimer)
+
+      source?.close()
     }
   }, [])
 
-  useEffect(() => {
-    const pick = () => setLiveCount(Math.floor(Math.random() * 50) + 1)
-
-    pick()
-
-    const timer = window.setInterval(pick, 20000)
-
-    return () => window.clearInterval(timer)
-  }, [])
-
   const handleVote = (id: string, option: number) => {
+    if (votePendingRef.current.has(id)) return
+
     if (profile[id]?.voted !== undefined && profile[id]?.voted !== null) return
 
-    const raw = rawPolls.find((p) => p.id === id)
+    const raw = allRawPolls.find((p) => p.id === id)
 
     if (raw && Date.now() - raw.createdAt > pollLifetimeMs(raw)) return
+
+    votePendingRef.current.add(id)
 
     playVoteSound()
 
     setProfile((prev) => ({ ...prev, [id]: { ...prev[id], voted: option } }))
 
-    const current = rawPolls.find((p) => p.id === id)
+    const current = allRawPolls.find((p) => p.id === id)
 
     const base = current ? normalizeVotes(current) : []
 
@@ -5423,10 +6123,42 @@ export default function App() {
       cur[option] = (cur[option] ?? 0) + 1
 
       tx.update(ref, { votes: cur })
-    }).catch((err) => console.error("Vote write failed", err))
+    }).then(
+      () => votePendingRef.current.delete(id),
+      (err) => {
+        console.error("Vote write failed", err)
+
+        votePendingRef.current.delete(id)
+
+        // Roll back the optimistic vote so the UI never shows a count
+        // that doesn't exist on the server.
+        setProfile((prev) => ({
+          ...prev,
+          [id]: { ...prev[id], voted: null },
+        }))
+
+        patchRaw(id, (p) => {
+          const votes = normalizeVotes(p).map((v, i) =>
+            i === option ? Math.max(0, v - 1) : v,
+          )
+
+          return { ...p, votes }
+        })
+
+        showToast("Vote failed — please try again", 3000)
+      },
+    )
   }
 
-  const handleComment = (pollId: string, text: string) => {
+  const handleComment = (pollId: string, text: string): boolean => {
+    if (commentPendingRef.current.has(pollId)) {
+      showToast("Still sending your previous comment…", 2200)
+
+      return false
+    }
+
+    commentPendingRef.current.add(pollId)
+
     const cid = `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`
 
     const comment: RawComment = {
@@ -5451,9 +6183,26 @@ export default function App() {
       comments: { ...p.comments, [cid]: comment },
     }))
 
-    updateDoc(doc(db, "polls", pollId), { [`comments.${cid}`]: comment }).catch(
-      (err) => console.error("Comment write failed", err),
-    )
+    updateDoc(doc(db, "polls", pollId), { [`comments.${cid}`]: comment })
+      .then(() => commentPendingRef.current.delete(pollId))
+      .catch((err) => {
+        console.error("Comment write failed", err)
+
+        commentPendingRef.current.delete(pollId)
+
+        // Roll back the optimistic comment so it doesn't linger forever.
+        patchRaw(pollId, (p) => {
+          const comments = { ...p.comments }
+
+          delete comments[cid]
+
+          return { ...p, comments }
+        })
+
+        showToast("Comment failed — please try again", 3000)
+      })
+
+    return true
   }
 
   const handleReplyComment = (
@@ -5462,7 +6211,17 @@ export default function App() {
     commentId: string,
 
     text: string,
-  ) => {
+  ): boolean => {
+    const replyKey = `${pollId}:${commentId}`
+
+    if (replyPendingRef.current.has(replyKey)) {
+      showToast("Still sending your previous reply…", 2200)
+
+      return false
+    }
+
+    replyPendingRef.current.add(replyKey)
+
     const rid = `r${Date.now()}${Math.random().toString(36).slice(2, 6)}`
 
     const reply: RawReply = {
@@ -5497,11 +6256,46 @@ export default function App() {
 
     updateDoc(doc(db, "polls", pollId), {
       [`comments.${commentId}.replies.${rid}`]: reply,
-    }).catch((err) => console.error("Reply write failed", err))
+    })
+      .then(() => replyPendingRef.current.delete(replyKey))
+      .catch((err) => {
+        console.error("Reply write failed", err)
+
+        replyPendingRef.current.delete(replyKey)
+
+        // Roll back the optimistic reply so it doesn't linger forever.
+        patchRaw(pollId, (p) => {
+          const comments = { ...p.comments }
+
+          const c = comments[commentId]
+
+          if (!c) return p
+
+          const replies = { ...(c.replies ?? {}) }
+
+          delete replies[rid]
+
+          comments[commentId] = { ...c, replies }
+
+          return { ...p, comments }
+        })
+
+        showToast("Reply failed — please try again", 3000)
+      })
+
+    return true
   }
 
   const handleLikeComment = (pollId: string, commentId: string) => {
-    const poll = rawPolls.find((p) => p.id === pollId)
+    const likeKey = `${pollId}:${commentId}`
+
+    if (likePendingRef.current.has(likeKey)) return
+
+    likePendingRef.current.add(likeKey)
+
+    const poll =
+      allRawPolls.find((p) => p.id === pollId) ??
+      allArchiveRawPolls.find((p) => p.id === pollId)
 
     const c = poll?.comments?.[commentId]
 
@@ -5535,13 +6329,24 @@ export default function App() {
       [`comments.${commentId}.likedBy`]: liked
         ? arrayRemove(anonId)
         : arrayUnion(anonId),
-    }).catch((err) => console.error("Comment like write failed", err))
+    }).then(
+      () => likePendingRef.current.delete(likeKey),
+      (err) => {
+        console.error("Comment like write failed", err)
+
+        likePendingRef.current.delete(likeKey)
+      },
+    )
   }
 
   const handleRedditVote = (id: string, vote: "up" | "down") => {
-    const raw = rawPolls.find((p) => p.id === id)
+    if (redditVotePendingRef.current.has(id)) return
+
+    const raw = allRawPolls.find((p) => p.id === id)
 
     if (raw && Date.now() - raw.createdAt > pollLifetimeMs(raw)) return
+
+    redditVotePendingRef.current.add(id)
 
     if (vote === "up") playUpvoteSound()
     else playDownvoteSound()
@@ -5583,44 +6388,72 @@ export default function App() {
     if (downDelta) update.downvotes = increment(downDelta)
 
     if (Object.keys(update).length > 0)
-      updateDoc(doc(db, "polls", id), update).catch((err) =>
-        console.error("Reddit vote write failed", err),
+      updateDoc(doc(db, "polls", id), update).then(
+        () => redditVotePendingRef.current.delete(id),
+        (err) => {
+          console.error("Reddit vote write failed", err)
+
+          redditVotePendingRef.current.delete(id)
+
+          // Roll back the optimistic up/down vote.
+          setProfile((prev) => ({
+            ...prev,
+            [id]: { ...prev[id], userVote: current },
+          }))
+
+          patchRaw(id, (p) => ({
+            ...p,
+
+            upvotes: Math.max(0, p.upvotes - upDelta),
+
+            downvotes: Math.max(0, p.downvotes - downDelta),
+          }))
+
+          showToast("Vote failed — please try again", 3000)
+        },
       )
+    else redditVotePendingRef.current.delete(id)
   }
 
   const handleShare = (poll: Poll) => {
     const url = buildShareUrl(poll)
+
+    const copyLink = async () => {
+      try {
+        await navigator.clipboard.writeText(url)
+      } catch {
+        const textarea = document.createElement("textarea")
+
+        textarea.value = url
+
+        textarea.style.position = "fixed"
+
+        textarea.style.opacity = "0"
+
+        document.body.appendChild(textarea)
+
+        textarea.select()
+
+        try {
+          document.execCommand("copy")
+        } catch {
+          /* ignore */
+        }
+
+        document.body.removeChild(textarea)
+      }
+
+      showToast("Link copied!")
+    }
 
     if (navigator.share) {
       navigator
 
         .share({ title: poll.question, url })
 
-        .then(() => showToast("🔗 Link copied!"))
-
-        .catch(() => {})
+        .catch(() => copyLink())
     } else {
-      const textarea = document.createElement("textarea")
-
-      textarea.value = url
-
-      textarea.style.position = "fixed"
-
-      textarea.style.opacity = "0"
-
-      document.body.appendChild(textarea)
-
-      textarea.select()
-
-      try {
-        document.execCommand("copy")
-      } catch {
-        /* ignore */
-      }
-
-      document.body.removeChild(textarea)
-
-      showToast("🔗 Link copied!")
+      copyLink()
     }
   }
 
@@ -5667,15 +6500,125 @@ export default function App() {
       comments: [],
     }
 
-    setOpenCommentsId(targetId)
-
     setRawPolls((prev) => [toRawPoll(feedPoll, anonId), ...prev])
 
     setDoc(doc(db, "polls", targetId), toRawPoll(feedPoll, anonId)).catch(
-      (err) => console.error("Shared poll save failed", err),
+      (err) => {
+        console.error("Shared poll save failed", err)
+
+        // Roll back the optimistic insert so no phantom poll lingers.
+        setRawPolls((prev) => prev.filter((p) => p.id !== targetId))
+
+        showToast("Couldn't save the poll — try again", 3500)
+
+        return
+      },
     )
 
     exitShared()
+
+    // Open the comment box only after exiting the shared view, otherwise
+    // exitShared's own clear would close it again in the same render.
+    setOpenCommentsId(targetId)
+  }
+
+  // Cursor-based pagination: fetch the next page of older polls (by
+  // createdAt desc — the only server-ordered axis; active sort modes are
+  // applied client-side over the merged set). Feed is capped at 10 pages
+  // (~600 polls) per session; the archive loads until exhausted.
+  const loadMoreFeed = async () => {
+    if (loadingMore || !feedHasMoreRef.current || !feedCursorRef.current) return
+
+    if (feedFetchCountRef.current >= 9) {
+      feedHasMoreRef.current = false
+
+      setHasMore(false)
+
+      return
+    }
+
+    setLoadingMore(true)
+
+    try {
+      const q = query(
+        collection(db, "polls"),
+
+        orderBy("createdAt", "desc"),
+
+        startAfter(feedCursorRef.current),
+
+        limit(60),
+      )
+
+      const snap = await getDocs(q)
+
+      const last = snap.docs[snap.docs.length - 1]
+
+      if (last) feedCursorRef.current = last
+
+      const docs = snap.docs.map((d) => d.data() as RawPoll)
+
+      if (docs.length > 0) setOlderPolls((prev) => mergeRawById(prev, docs))
+
+      const nextCount = feedFetchCountRef.current + 1
+
+      feedFetchCountRef.current = nextCount
+
+      const full = snap.docs.length === 60
+
+      feedHasMoreRef.current = full && nextCount < 9
+
+      setHasMore(feedHasMoreRef.current)
+    } catch (err) {
+      console.error("Feed load more failed", err)
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
+  const loadMoreArchive = async () => {
+    if (archiveLoadingMore || !archiveHasMoreRef.current || !archiveCursorRef.current)
+      return
+
+    setArchiveLoadingMore(true)
+
+    try {
+      const q = query(
+        collection(db, "polls"),
+
+        orderBy("createdAt", "desc"),
+
+        startAfter(archiveCursorRef.current),
+
+        limit(50),
+      )
+
+      const snap = await getDocs(q)
+
+      const last = snap.docs[snap.docs.length - 1]
+
+      if (last) archiveCursorRef.current = last
+
+      const docs = snap.docs.map((d) => d.data() as RawPoll)
+
+      if (docs.length > 0)
+        setOlderArchivePolls((prev) => mergeRawById(prev, docs))
+
+      archiveHasMoreRef.current = snap.docs.length === 50
+
+      setArchiveHasMore(archiveHasMoreRef.current)
+    } catch (err) {
+      console.error("Archive load more failed", err)
+    } finally {
+      setArchiveLoadingMore(false)
+    }
+  }
+
+  const loadMoreRef = useRef<() => void>(() => {})
+
+  loadMoreRef.current = () => {
+    if (archiveView) loadMoreArchive()
+    else loadMoreFeed()
   }
 
   const handleNewPoll = (
@@ -5723,15 +6666,31 @@ export default function App() {
 
     setRawPolls((prev) => [toRawPoll(newPoll, anonId), ...prev])
 
-    setDoc(doc(db, "polls", newPoll.id), toRawPoll(newPoll, anonId)).catch(
-      (err) => console.error("Post poll failed", err),
-    )
+    setDoc(doc(db, "polls", newPoll.id), toRawPoll(newPoll, anonId))
+      .then(() => showToast("🌴 Posted!", 2000))
+      .catch((err) => {
+        console.error("Post poll failed", err)
+
+        // Roll back the optimistic insert so no phantom poll lingers
+        // in the feed after a rejected write.
+        setRawPolls((prev) => prev.filter((p) => p.id !== newPoll.id))
+
+        showToast("Post failed — check your connection", 3500)
+      })
   }
 
   const handleDeletePoll = (id: string) => {
     setConfirmDelete(null)
 
-    setRawPolls((prev) => prev.filter((p) => p.id !== id))
+    const remove = (prev: RawPoll[]) => prev.filter((p) => p.id !== id)
+
+    setRawPolls(remove)
+
+    setOlderPolls(remove)
+
+    setArchiveRawPolls(remove)
+
+    setOlderArchivePolls(remove)
 
     deleteDoc(doc(db, "polls", id)).catch((err) =>
       console.error("Delete poll failed", err),
@@ -5741,9 +6700,16 @@ export default function App() {
   const handleArchivePoll = (id: string) => {
     setConfirmDelete(null)
 
-    setRawPolls((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, archived: true } : p)),
-    )
+    const archive = (prev: RawPoll[]) =>
+      prev.map((p) => (p.id === id ? { ...p, archived: true } : p))
+
+    setRawPolls(archive)
+
+    setOlderPolls(archive)
+
+    setArchiveRawPolls(archive)
+
+    setOlderArchivePolls(archive)
 
     updateDoc(doc(db, "polls", id), { archived: true }).catch((err) =>
       console.error("Archive poll failed", err),
@@ -5802,50 +6768,94 @@ export default function App() {
     signOut(auth).catch(() => {})
   }
 
-  const filtered = (archiveView ? archivePolls : polls).filter((p) => {
-    const q = search.toLowerCase()
+  const filtered = useMemo(
+    () =>
+      (archiveView ? archivePolls : polls).filter((p) => {
+        const q = search.toLowerCase()
 
-    const matchSearch =
-      !q ||
-      p.question.toLowerCase().includes(q) ||
-      (p.description?.toLowerCase().includes(q) ?? false) ||
-      p.author.toLowerCase().includes(q) ||
-      p.options.some((o) => o.toLowerCase().includes(q)) ||
-      p.category.toLowerCase().includes(q)
+        const matchSearch =
+          !q ||
+          p.question.toLowerCase().includes(q) ||
+          (p.description?.toLowerCase().includes(q) ?? false) ||
+          p.author.toLowerCase().includes(q) ||
+          p.options.some((o) => o.toLowerCase().includes(q)) ||
+          p.category.toLowerCase().includes(q)
 
-    if (archiveView) return p.expired && matchSearch
+        if (archiveView) return p.expired && matchSearch
 
-    if (p.archived) return false
+        if (p.archived) return false
 
-    if (showMine && p.creatorId !== anonId) return false
+        if (showMine && p.creatorId !== anonId) return false
 
-    const matchFilter = filter === "all" || p.category === filter
+        const matchFilter = filter === "all" || p.category === filter
 
-    return matchFilter && matchSearch
-  })
+        return matchFilter && matchSearch
+      }),
+    [archiveView, archivePolls, polls, search, showMine, anonId, filter],
+  )
 
-  const sorted = [...filtered].sort((a, b) => {
-    if (archiveView) return b.createdAt - a.createdAt
+  const sorted = useMemo(
+    () =>
+      [...filtered].sort((a, b) => {
+        if (archiveView) {
+          const votesA = a.votes.reduce((s, v) => s + v, 0)
 
-    const votesA = a.votes.reduce((s, v) => s + v, 0)
+          const votesB = b.votes.reduce((s, v) => s + v, 0)
 
-    const votesB = b.votes.reduce((s, v) => s + v, 0)
+          if (archiveSort === "newest") return b.createdAt - a.createdAt
 
-    if (sort === "newest") return b.createdAt - a.createdAt
+          return votesB - votesA
+        }
 
-    if (sort === "mostVoted") return votesB - votesA
+        const votesA = a.votes.reduce((s, v) => s + v, 0)
 
-    if (sort === "popular") return b.upvotes - a.upvotes
+        const votesB = b.votes.reduce((s, v) => s + v, 0)
 
-    if (sort === "trending" && a.expired !== b.expired)
-      return a.expired ? 1 : -1
+        if (sort === "newest") return b.createdAt - a.createdAt
 
-    if (a.hot !== b.hot) return a.hot ? -1 : 1
+        if (sort === "mostVoted") return votesB - votesA
 
-    return votesB - votesA
-  })
+        if (sort === "popular") return b.upvotes - a.upvotes
+
+        if (sort === "trending" && a.expired !== b.expired)
+          return a.expired ? 1 : -1
+
+        if (a.hot !== b.hot) return a.hot ? -1 : 1
+
+        return votesB - votesA
+      }),
+    [filtered, archiveView, archiveSort, sort],
+  )
+
+  // Everything already on screen during the first paint is "seen": entrance
+  // animations are reserved for polls that arrive after the page has loaded,
+  // so a reload at any scroll position never triggers a full-feed strobe.
+  if (!bootedRef.current && sorted.length > 0) {
+    bootedRef.current = true
+    feedSeenRef.current = new Set(sorted.map((p) => p.id))
+  }
 
   const contentWidth = isNarrow ? "100%" : view === "grid" ? 960 : 620
+
+  // Infinite scroll: when the sentinel at the bottom of the feed enters the
+  // viewport (600px margin), pull the next page. Re-observes whenever the
+  // list size or active view changes so the sentinel is always wired up.
+  useEffect(() => {
+    const el = sentinelRef.current
+
+    if (!el || typeof IntersectionObserver === "undefined") return
+
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) loadMoreRef.current()
+      },
+      { rootMargin: "600px 0px" },
+    )
+
+    obs.observe(el)
+
+    return () => obs.disconnect()
+  }, [sorted.length, archiveView])
 
   if (sharedPoll) {
     return (
@@ -5870,14 +6880,16 @@ export default function App() {
 
           zIndex: 50,
 
-          background: "var(--bg-92)",
+          background: "var(--bg)",
 
-          willChange: "transform",
+          transform: chromeHidden ? "translateY(-100%)" : "translateY(0)",
+
+          transition: "transform 0.35s cubic-bezier(0.22, 1, 0.36, 1)",
         }}
       >
         <header
           style={{
-            background: "var(--bg-92)",
+            background: "var(--bg)",
 
             borderBottom: "1px solid var(--border)",
           }}
@@ -5894,25 +6906,34 @@ export default function App() {
             {/* Top row */}
             {isNarrow ? (
               <>
-                {/* Mobile row 1: logo + primary CTA */}
+                {/* Mobile row 1: logo + online counter, controls right */}
                 <div
                   style={{
                     display: "flex",
 
-                    alignItems: "center",
+                    alignItems: "flex-start",
 
-                    gap: 10,
+                    gap: 8,
 
-                    padding: "12px 0 2px",
+                    padding: "10px 0 6px",
                   }}
                 >
+                  <div
+                    style={{
+                      display: "flex",
+
+                      flexDirection: "column",
+
+                      gap: 5,
+                    }}
+                  >
                   <button
                     onClick={() => {
                       setSearch("")
 
                       setFilter("all")
 
-                      setSort("popular")
+                      setSort("newest")
 
                       setShowMine(false)
 
@@ -5941,7 +6962,7 @@ export default function App() {
                       style={{
                         fontFamily: "Satoshi, sans-serif",
 
-                        fontSize: 25,
+                        fontSize: 22,
 
                         fontWeight: 900,
 
@@ -5962,81 +6983,37 @@ export default function App() {
                     >
                       Bageecha
                     </h1>
-                    <IslandLogo size={20} />
+                    <IslandLogo size={18} />
                   </button>
-                  <button
-                    onClick={() => setShowModal(true)}
+                  <span
                     style={{
-                      marginLeft: "auto",
+                      fontSize: 10.5,
 
-                      background: "var(--gradient)",
+                      fontWeight: 800,
 
-                      border: "none",
+                      color: "var(--text-faint)",
 
-                      borderRadius: 10,
+                      letterSpacing: "0.07em",
 
-                      height: 36,
+                      textTransform: "uppercase",
 
-                      padding: "0 20px",
-
-                      lineHeight: 1,
-
-                      color: "#fff",
-
-                      fontFamily: "Satoshi, sans-serif",
-
-                      fontWeight: 900,
-
-                      fontSize: 13.5,
-
-                      cursor: "pointer",
-
-                      boxShadow: "0 3px 14px var(--primary-glow)",
-                    }}
-                  >
-                    + Poll
-                  </button>
-                </div>
-                {/* Mobile row 2: secondary controls */}
-                <div
-                  style={{
-                    display: "flex",
-
-                    alignItems: "center",
-
-                    justifyContent: "center",
-
-                    gap: 8,
-
-                    padding: "10px 0",
-                  }}
-                >
-                  <div
-                    style={{
                       display: "flex",
 
                       alignItems: "center",
 
-                      gap: 5,
+                      gap: 6,
 
-                      background: "var(--surface)",
+                      lineHeight: 1,
 
-                      height: 26,
-
-                      padding: "0 10px",
-
-                      borderRadius: 99,
-
-                      border: "1px solid var(--border)",
+                      whiteSpace: "nowrap",
                     }}
-                    title="people online"
                   >
                     <span
                       className="pulse-dot"
                       style={{
-                        width: 6,
+                        width: 5,
 
-                        height: 6,
+                        height: 5,
 
                         borderRadius: "50%",
 
@@ -6045,216 +7022,47 @@ export default function App() {
                         display: "inline-block",
                       }}
                     />
-                    <span
-                      style={{
-                        fontSize: 12,
-
-                        fontWeight: 800,
-
-                        color: "var(--text-dim)",
-
-                        lineHeight: 1,
-                      }}
-                    >
-                      {liveCount.toLocaleString()}
-                    </span>
+                    {liveCount.toLocaleString()} islanders online
+                  </span>
                   </div>
-                  <ThemePicker theme={theme} onChange={setTheme} compact />
-                  <button
-                    onClick={() => setShowRules(true)}
-                    title="Rules"
+                  <div
                     style={{
-                      background: "none",
-
-                      border: "1px solid var(--border)",
-
-                      borderRadius: 9,
-
-                      height: 34,
-
-                      minWidth: 34,
-
-                      padding: "0 10px",
-
-                      lineHeight: 1,
-
-                      color: "var(--text-dim)",
-
-                      fontFamily: "Satoshi, sans-serif",
-
-                      fontWeight: 800,
-
-                      fontSize: 13,
-
-                      cursor: "pointer",
+                      marginLeft: "auto",
 
                       display: "flex",
 
                       alignItems: "center",
 
-                      justifyContent: "center",
+                      gap: 6,
                     }}
                   >
-                    <RulesIcon />
-                  </button>
-                  {isAdmin ? (
-                    <button
-                      onClick={handleAdminLogout}
-                      title={user?.email ?? "Signed in"}
-                      style={{
-                        background: "var(--surface-2)",
-
-                        border: "1px solid var(--accent-soft)",
-
-                        borderRadius: 9,
-
-                        height: 34,
-
-                        minWidth: 34,
-
-                        padding: "0 10px",
-
-                        lineHeight: 1,
-
-                        color: "var(--accent)",
-
-                        fontFamily: "Satoshi, sans-serif",
-
-                        fontWeight: 800,
-
-                        fontSize: 13,
-
-                        cursor: "pointer",
-
-                        display: "flex",
-
-                        alignItems: "center",
-
-                        justifyContent: "center",
-                      }}
-                    >
-                      <KeyIcon />
-                    </button>
-                  ) : (
-                    <button
-                      onClick={handleAdminLogin}
-                      title="Admin sign-in"
-                      style={{
-                        background: "none",
-
-                        border: "1px solid var(--border)",
-
-                        borderRadius: 9,
-
-                        height: 34,
-
-                        minWidth: 34,
-
-                        padding: "0 10px",
-
-                        lineHeight: 1,
-
-                        color: "var(--text-dim)",
-
-                        fontFamily: "Satoshi, sans-serif",
-
-                        fontWeight: 800,
-
-                        fontSize: 13,
-
-                        cursor: "pointer",
-
-                        display: "flex",
-
-                        alignItems: "center",
-
-                        justifyContent: "center",
-                      }}
-                    >
-                      <KeyIcon />
-                    </button>
-                  )}
-                  <button
-                    onClick={() => {
-                      setShowMine(!showMine)
-
-                      setShowArchive(false)
-
-                      setShowModal(false)
-                    }}
-                    title="My polls"
-                    style={{
-                      background: showMine ? "var(--surface-2)" : "none",
-
-                      border: showMine
-                        ? "1px solid var(--primary-soft)"
-                        : "1px solid var(--border)",
-
-                      borderRadius: 9,
-
-                      height: 34,
-
-                      minWidth: 34,
-
-                      padding: "0 10px",
-
-                      color: showMine ? "var(--primary)" : "var(--text-dim)",
-
-                      fontFamily: "Satoshi, sans-serif",
-
-                      fontWeight: 800,
-
-                      fontSize: 13,
-
-                      cursor: "pointer",
-
-                      transition: "all 0.15s",
-
-                      display: "flex",
-
-                      alignItems: "center",
-
-                      justifyContent: "center",
-                    }}
-                  >
-                    <PersonIcon />
-                  </button>
-                  {isAdmin && (
                     <button
                       onClick={() => {
-                        setShowArchive(!showArchive)
+                        setShowMine(!showMine)
 
-                        setShowMine(false)
+                        setShowArchive(false)
 
                         setShowModal(false)
                       }}
-                      title="Archive"
+                      title="My polls"
                       style={{
-                        background: showArchive ? "var(--surface-2)" : "none",
+                        background: showMine ? "var(--surface-2)" : "none",
 
-                        border: showArchive
-                          ? "1px solid var(--accent-soft)"
+                        border: showMine
+                          ? "1px solid var(--primary-soft)"
                           : "1px solid var(--border)",
 
-                        borderRadius: 9,
+                        borderRadius: 10,
 
-                        height: 34,
+                        height: 40,
 
-                        minWidth: 34,
+                        minWidth: 40,
 
-                        padding: "0 10px",
+                        padding: 0,
 
                         lineHeight: 1,
 
-                        color: showArchive
-                          ? "var(--accent)"
-                          : "var(--text-dim)",
-
-                        fontFamily: "Satoshi, sans-serif",
-
-                        fontWeight: 800,
-
-                        fontSize: 13,
+                        color: showMine ? "var(--primary)" : "var(--text-dim)",
 
                         cursor: "pointer",
 
@@ -6267,9 +7075,182 @@ export default function App() {
                         justifyContent: "center",
                       }}
                     >
-                      <ArchiveIcon />
+                      <PersonIcon size={19} />
                     </button>
-                  )}
+                    <button
+                      onClick={() => setShowRules(true)}
+                      title="Rules"
+                      style={{
+                        background: "none",
+
+                        border: "1px solid var(--border)",
+
+                        borderRadius: 10,
+
+                        height: 40,
+
+                        minWidth: 40,
+
+                        padding: 0,
+
+                        lineHeight: 1,
+
+                        color: "var(--text-dim)",
+
+                        cursor: "pointer",
+
+                        display: "flex",
+
+                        alignItems: "center",
+
+                        justifyContent: "center",
+                      }}
+                    >
+                      <RulesIcon size={19} />
+                    </button>
+                    {isAdmin ? (
+                      <button
+                        onClick={handleAdminLogout}
+                        title={user?.email ?? "Signed in"}
+                        style={{
+                          background: "var(--surface-2)",
+
+                          border: "1px solid var(--accent-soft)",
+
+                          borderRadius: 10,
+
+                          height: 40,
+
+                          minWidth: 40,
+
+                          padding: 0,
+
+                          lineHeight: 1,
+
+                          color: "var(--accent)",
+
+                          cursor: "pointer",
+
+                          display: "flex",
+
+                          alignItems: "center",
+
+                          justifyContent: "center",
+                        }}
+                      >
+                        <KeyIcon size={19} />
+                      </button>
+                    ) : (
+                      <button
+                        onClick={handleAdminLogin}
+                        title="Admin sign-in"
+                        style={{
+                          background: "none",
+
+                          border: "1px solid var(--border)",
+
+                          borderRadius: 10,
+
+                          height: 40,
+
+                          minWidth: 40,
+
+                          padding: 0,
+
+                          lineHeight: 1,
+
+                          color: "var(--text-dim)",
+
+                          cursor: "pointer",
+
+                          display: "flex",
+
+                          alignItems: "center",
+
+                          justifyContent: "center",
+                        }}
+                      >
+                        <KeyIcon size={19} />
+                      </button>
+                    )}
+                    <button
+                      onClick={() => {
+                        setShowArchive(!showArchive)
+
+                        setShowMine(false)
+
+                        setShowModal(false)
+                      }}
+                      title="Archive"
+                      style={{
+                        position: "relative",
+
+                        background: "var(--surface-2)",
+
+                        border: showArchive
+                          ? "1.5px solid var(--accent)"
+                          : "1px solid var(--accent-soft)",
+
+                        borderRadius: 10,
+
+                        height: 40,
+
+                        minWidth: 40,
+
+                        padding: 0,
+
+                        lineHeight: 1,
+
+                        color: "var(--accent)",
+
+                        cursor: "pointer",
+
+                        transition: "all 0.15s",
+
+                        display: "flex",
+
+                        alignItems: "center",
+
+                        justifyContent: "center",
+                      }}
+                    >
+                      <span style={{ position: "relative" }}>
+                        <ArchiveIcon size={19} />
+                        {archiveClosed.length > 0 && (
+                          <span
+                            style={{
+                              position: "absolute",
+
+                              top: -6,
+
+                              right: -10,
+
+                              background: "var(--accent)",
+
+                              color: "var(--bg)",
+
+                              fontSize: 9,
+
+                              fontWeight: 900,
+
+                              lineHeight: 1.3,
+
+                              padding: "1.5px 4px",
+
+                              borderRadius: 99,
+
+                              minWidth: 15,
+
+                              textAlign: "center",
+                            }}
+                          >
+                            {archiveClosed.length}
+                          </span>
+                        )}
+                      </span>
+                    </button>
+                    <ThemePicker theme={theme} onChange={setTheme} compact />
+                  </div>
                 </div>
               </>
             ) : (
@@ -6301,7 +7282,7 @@ export default function App() {
 
                       setFilter("all")
 
-                      setSort("popular")
+                      setSort("newest")
 
                       setShowMine(false)
 
@@ -6330,7 +7311,7 @@ export default function App() {
                       style={{
                         fontFamily: "Satoshi, sans-serif",
 
-                        fontSize: 24,
+                        fontSize: view === "grid" ? 30 : 24,
 
                         fontWeight: 900,
 
@@ -6567,57 +7548,55 @@ export default function App() {
                   >
                     <PersonIcon size={17} />
                   </button>
-                  {isAdmin && (
-                    <button
-                      onClick={() => {
-                        setShowArchive(!showArchive)
+                  <button
+                    onClick={() => {
+                      setShowArchive(!showArchive)
 
-                        setShowMine(false)
+                      setShowMine(false)
 
-                        setShowModal(false)
-                      }}
-                      title="Archive"
-                      style={{
-                        background: showArchive ? "var(--surface-2)" : "none",
+                      setShowModal(false)
+                    }}
+                    title="Archive"
+                    style={{
+                      background: showArchive ? "var(--surface-2)" : "none",
 
-                        border: showArchive
-                          ? "1px solid var(--accent-soft)"
-                          : "1px solid var(--border)",
+                      border: showArchive
+                        ? "1px solid var(--accent-soft)"
+                        : "1px solid var(--border)",
 
-                        borderRadius: 9,
+                      borderRadius: 9,
 
-                        height: 36,
+                      height: 36,
 
-                        minWidth: 36,
+                      minWidth: 36,
 
-                        padding: "0 10px",
+                      padding: "0 10px",
 
-                        lineHeight: 1,
+                      lineHeight: 1,
 
-                        color: showArchive
-                          ? "var(--accent)"
-                          : "var(--text-dim)",
+                      color: showArchive
+                        ? "var(--accent)"
+                        : "var(--text-dim)",
 
-                        fontFamily: "Satoshi, sans-serif",
+                      fontFamily: "Satoshi, sans-serif",
 
-                        fontWeight: 800,
+                      fontWeight: 800,
 
-                        fontSize: 14,
+                      fontSize: 14,
 
-                        cursor: "pointer",
+                      cursor: "pointer",
 
-                        transition: "all 0.15s",
+                      transition: "all 0.15s",
 
-                        display: "flex",
+                      display: "flex",
 
-                        alignItems: "center",
+                      alignItems: "center",
 
-                        justifyContent: "center",
-                      }}
-                    >
-                      <ArchiveIcon size={17} />
-                    </button>
-                  )}
+                      justifyContent: "center",
+                    }}
+                  >
+                    <ArchiveIcon size={17} />
+                  </button>
                   <button
                     onClick={() => setShowModal(true)}
                     style={{
@@ -6643,7 +7622,7 @@ export default function App() {
 
                       cursor: "pointer",
 
-                      boxShadow: "0 3px 14px var(--primary-glow)",
+                      boxShadow: "0 4px 18px var(--primary-glow-strong)",
                     }}
                   >
                     + Poll
@@ -6653,7 +7632,12 @@ export default function App() {
             )}
 
             {/* Cove search */}
-            <div style={{ paddingTop: isNarrow ? 4 : 8, paddingBottom: 16 }}>
+            <div
+              style={{
+                paddingTop: isNarrow ? 2 : 8,
+                paddingBottom: isNarrow ? 12 : 16,
+              }}
+            >
               <div
                 style={{
                   position: "relative",
@@ -6667,7 +7651,7 @@ export default function App() {
 
                   boxShadow: searchActive
                     ? "0 10px 36px var(--primary-glow-strong)"
-                    : "0 4px 18px var(--primary-glow)",
+                    : "none",
 
                   transition: "box-shadow 0.25s",
                 }}
@@ -6677,20 +7661,20 @@ export default function App() {
                     style={{
                       position: "absolute",
 
-                      left: 18,
+                      left: isNarrow ? 15 : 18,
 
                       top: "50%",
 
                       transform: "translateY(-50%)",
 
-                      fontSize: 16,
-
                       pointerEvents: "none",
 
                       opacity: 0.6,
+
+                      color: "var(--text-muted)",
                     }}
                   >
-                    🔍
+                    <SearchIcon size={isNarrow ? 14 : 15} />
                   </span>
                   <input
                     value={search}
@@ -6717,7 +7701,7 @@ export default function App() {
 
                       borderRadius: 99,
 
-                      padding: "14px 46px",
+                      padding: isNarrow ? "10px 40px" : "14px 46px",
 
                       color: "var(--text)",
 
@@ -6789,19 +7773,20 @@ export default function App() {
             }}
           >
             {archiveView ? (
-              <div
-                style={{
-                  display: "flex",
+              <>
+                <div
+                  style={{
+                    display: "flex",
 
-                  alignItems: "center",
+                    alignItems: "center",
 
-                  gap: 10,
+                    gap: 10,
 
-                  marginBottom: 6,
+                    marginBottom: 6,
 
-                  flexWrap: "wrap",
-                }}
-              >
+                    flexWrap: "wrap",
+                  }}
+                >
                 <span
                   style={{
                     fontSize: 11,
@@ -6821,7 +7806,7 @@ export default function App() {
                     gap: 6,
                   }}
                 >
-                  🗃️ Archive
+                  <ArchiveIcon size={14} /> Closed Polls
                 </span>
                 <span
                   style={{
@@ -6863,6 +7848,111 @@ export default function App() {
                   ← Back to feed
                 </button>
               </div>
+              <div
+                style={{
+                  display: "flex",
+
+                  alignItems: "center",
+
+                  gap: 8,
+
+                  marginBottom: isNarrow ? 4 : 6,
+
+                  flexWrap: isNarrow ? "nowrap" : "wrap",
+                }}
+              >
+                {!isNarrow && (
+                <span
+                  style={{
+                    fontSize: 10,
+
+                    fontWeight: 700,
+
+                    color: "var(--text-faint)",
+
+                    letterSpacing: "0.08em",
+
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Sort by
+                </span>
+                )}
+                <div
+                  style={{
+                    display: "flex",
+
+                    background: "var(--surface)",
+
+                    border: "1px solid var(--border)",
+
+                    borderRadius: isNarrow ? 9 : 10,
+
+                    padding: isNarrow ? 2 : 3,
+
+                    maxWidth: isNarrow ? "100%" : "none",
+
+                    overflowX: isNarrow ? "auto" : "visible",
+                  }}
+                >
+                  {([
+                    { value: "newest", label: "Newest", Icon: ClockIcon },
+                    { value: "mostVoted", label: "Most Voted", Icon: ChartIcon },
+                  ] as const).map((opt) => {
+                    const active = archiveSort === opt.value
+
+                    return (
+                      <button
+                        key={opt.value}
+                        onClick={() => setArchiveSort(opt.value)}
+                        style={{
+                          background: active
+                            ? "var(--primary-soft-bg)"
+                            : "transparent",
+
+                          color: active
+                            ? "var(--primary)"
+                            : "var(--text-muted)",
+
+                          border: "none",
+
+                          borderRadius: isNarrow ? 7 : 8,
+
+                          padding: isNarrow ? "5px 9px" : "6px 11px",
+
+                          fontFamily: "Satoshi, sans-serif",
+
+                          fontWeight: 800,
+
+                          fontSize: isNarrow ? 11.5 : 12,
+
+                          cursor: "pointer",
+
+                          transition: "all 0.15s",
+
+                          whiteSpace: "nowrap",
+
+                          flexShrink: 0,
+                        }}
+                      >
+                        <span
+                          style={{
+                            display: "flex",
+
+                            alignItems: "center",
+
+                            gap: isNarrow ? 4 : 5,
+                          }}
+                        >
+                          <opt.Icon size={isNarrow ? 12 : 13} />
+                          {opt.label}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+              </>
             ) : (
               <div
                 style={{
@@ -6870,11 +7960,11 @@ export default function App() {
 
                   alignItems: "center",
 
-                  gap: 10,
+                  gap: 8,
 
-                  marginBottom: 6,
+                  marginBottom: isNarrow ? 4 : 6,
 
-                  flexWrap: "wrap",
+                  flexWrap: "nowrap",
                 }}
               >
                 <div
@@ -6883,26 +7973,32 @@ export default function App() {
 
                     alignItems: "center",
 
-                    gap: 8,
+                    gap: 6,
 
-                    flexWrap: "wrap",
+                    flex: 1,
+
+                    minWidth: 0,
+
+                    flexWrap: "nowrap",
                   }}
                 >
+                  {!isNarrow && (
                   <span
                     style={{
                       fontSize: 10,
 
-                      fontWeight: 800,
+                      fontWeight: 700,
 
                       color: "var(--text-faint)",
 
-                      letterSpacing: "0.08em",
+                      letterSpacing: "0.06em",
 
                       textTransform: "uppercase",
                     }}
                   >
                     Sort by
                   </span>
+                  )}
                   <div
                     style={{
                       display: "flex",
@@ -6911,25 +8007,22 @@ export default function App() {
 
                       border: "1px solid var(--border)",
 
-                      borderRadius: 10,
+                      borderRadius: 9,
 
-                      padding: 3,
+                      padding: 2,
 
-                      maxWidth: isNarrow ? "100%" : "none",
+                      maxWidth: "100%",
 
-                      overflowX: isNarrow ? "auto" : "visible",
+                      overflowX: "auto",
                     }}
                   >
-                    {([
-                      { value: "trending", label: "🔥 Trending" },
-
-                      { value: "popular", label: "⭐ Popular" },
-
-                      { value: "newest", label: "🕒 Newest" },
-
-                      { value: "mostVoted", label: "📊 Most Voted" },
-                    ] as const).map((opt) => {
-                      const active = sort === opt.value
+                  {([
+                    { value: "trending", label: "Trending", Icon: TrendingUpIcon },
+                    { value: "popular", label: "Popular", Icon: StarIcon },
+                    { value: "newest", label: "Newest", Icon: ClockIcon },
+                    { value: "mostVoted", label: "Most Voted", Icon: ChartIcon },
+                  ] as const).map((opt) => {
+                    const active = sort === opt.value
 
                       return (
                         <button
@@ -6937,22 +8030,24 @@ export default function App() {
                           onClick={() => setSort(opt.value)}
                           style={{
                             background: active
-                              ? "var(--gradient)"
+                              ? "var(--primary-soft-bg)"
                               : "transparent",
 
-                            color: active ? "#fff" : "var(--text-muted)",
+                            color: active
+                              ? "var(--primary)"
+                              : "var(--text-muted)",
 
                             border: "none",
 
-                            borderRadius: 8,
+                            borderRadius: 7,
 
-                            padding: "6px 11px",
+                            padding: "5px 9px",
 
                             fontFamily: "Satoshi, sans-serif",
 
                             fontWeight: 800,
 
-                            fontSize: 12,
+                            fontSize: 11.5,
 
                             cursor: "pointer",
 
@@ -6962,15 +8057,26 @@ export default function App() {
 
                             flexShrink: 0,
                           }}
-                        >
-                          {opt.label}
-                        </button>
-                      )
-                    })}
-                  </div>
-                </div>
+                      >
+                        <span
+                          style={{
+                            display: "flex",
 
-                <div style={{ position: "relative", flexShrink: 0 }}>
+                            alignItems: "center",
+
+                            gap: 4,
+                          }}
+                        >
+                          <opt.Icon size={12} />
+                          {opt.label}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+
+              <div style={{ position: "relative", flexShrink: 0 }}>
                   <button
                     onClick={(e) => {
                       e.stopPropagation()
@@ -6986,16 +8092,21 @@ export default function App() {
                       gap: 7,
 
                       background:
-                        filter !== "all" ? "var(--gradient)" : "var(--surface)",
+                        filter !== "all"
+                          ? "var(--primary-soft-bg)"
+                          : "var(--surface)",
 
-                      color: filter !== "all" ? "#fff" : "var(--text-muted)",
+                      color:
+                        filter !== "all" ? "var(--primary)" : "var(--text-muted)",
 
                       padding: "7px 14px",
 
                       borderRadius: 99,
 
                       border:
-                        filter !== "all" ? "none" : "1px solid var(--border)",
+                        filter !== "all"
+                          ? "1px solid var(--primary-soft)"
+                          : "1px solid var(--border)",
 
                       cursor: "pointer",
 
@@ -7007,15 +8118,22 @@ export default function App() {
 
                       fontSize: 13,
 
-                      boxShadow:
-                        filter !== "all"
-                          ? "0 2px 10px var(--primary-glow)"
-                          : "none",
+                      boxShadow: "none",
                     }}
                   >
-                    <span>
-                      {ALL_FILTERS.find((f) => f.value === filter)?.label ??
-                        "All"}
+                    <span
+                      style={{
+                        display: "inline-flex",
+
+                        alignItems: "center",
+
+                        gap: 6,
+                      }}
+                    >
+                      {filter !== "all" && (
+                        <CategoryIcon cat={filter} size={13} />
+                      )}
+                      {filters.find((f) => f.value === filter)?.label ?? "All"}
                     </span>
                     <span
                       style={{
@@ -7103,7 +8221,20 @@ export default function App() {
                               cursor: "pointer",
                             }}
                           >
-                            <span>{f.label}</span>
+                            <span
+                              style={{
+                                display: "inline-flex",
+
+                                alignItems: "center",
+
+                                gap: 8,
+                              }}
+                            >
+                              {f.value !== "all" && (
+                                <CategoryIcon cat={String(f.value)} size={13} />
+                              )}
+                              {f.label}
+                            </span>
                             {active && (
                               <span
                                 style={{
@@ -7129,9 +8260,19 @@ export default function App() {
                   style={{
                     display: "flex",
 
-                    gap: 6,
+                    gap: 2,
 
                     flexShrink: 0,
+
+                    marginLeft: 0,
+
+                    background: "var(--surface)",
+
+                    border: "1px solid var(--border)",
+
+                    borderRadius: 9,
+
+                    padding: 2,
                   }}
                 >
                   {([
@@ -7151,19 +8292,23 @@ export default function App() {
 
                           alignItems: "center",
 
+                          justifyContent: "center",
+
                           gap: 5,
 
                           background: active
-                            ? "var(--gradient)"
-                            : "var(--surface)",
+                            ? "var(--primary-soft-bg)"
+                            : "transparent",
 
-                          color: active ? "#fff" : "var(--text-muted)",
+                          color: active
+                            ? "var(--primary)"
+                            : "var(--text-muted)",
 
-                          border: active ? "none" : "1px solid var(--border)",
+                          border: "none",
 
-                          borderRadius: 9,
+                          borderRadius: 7,
 
-                          padding: "6px 9px",
+                          padding: "5px 8px",
 
                           fontFamily: "Satoshi, sans-serif",
 
@@ -7176,7 +8321,11 @@ export default function App() {
                           transition: "all 0.15s",
                         }}
                       >
-                        {opt.value === "list" ? "≡" : "▦"}
+                        {opt.value === "list" ? (
+                          <ListIcon size={15} />
+                        ) : (
+                          <GridIcon size={15} />
+                        )}
                       </button>
                     )
                   })}
@@ -7195,7 +8344,7 @@ export default function App() {
 
             backgroundSize: "200% 100%",
 
-            opacity: 0.65,
+            opacity: 0.5,
           }}
         />
       </div>
@@ -7207,7 +8356,7 @@ export default function App() {
 
           margin: "0 auto",
 
-          padding: "16px 14px 96px",
+          padding: isNarrow ? "12px 14px 96px" : "22px 14px 96px",
         }}
       >
         {dbError && (
@@ -7235,7 +8384,7 @@ export default function App() {
           </div>
         )}
         {/* Results count when searching */}
-        {!archiveView && (search || filter !== "all") && (
+        {(search || (!archiveView && filter !== "all")) && (
           <p
             style={{
               color: "var(--text-faint)",
@@ -7252,9 +8401,98 @@ export default function App() {
           </p>
         )}
 
-        {archiveView ? (
-          <ArchiveTable polls={sorted} onDelete={(p) => setConfirmDelete(p)} />
-        ) : loading && sorted.length === 0 ? (
+        {archiveView && (
+          <div
+            style={{
+              display: "flex",
+
+              flexWrap: "wrap",
+
+              gap: 8,
+
+              marginBottom: 12,
+            }}
+          >
+            {(() => {
+              const totalVotes = archiveClosed.reduce(
+                (s, p) => s + p.votes.reduce((a, v) => a + v, 0),
+                0,
+              )
+
+              const top = [...archiveClosed].sort(
+                (a, b) =>
+                  b.votes.reduce((s, v) => s + v, 0) -
+                  a.votes.reduce((s, v) => s + v, 0),
+              )[0]
+
+              const chip = (
+                icon: ReactNode,
+                label: string,
+                sub: string,
+                maxW: number,
+              ) => (
+                <span
+                  style={{
+                    display: "flex",
+
+                    alignItems: "center",
+
+                    gap: 7,
+
+                    background: "var(--surface)",
+
+                    border: "1px solid var(--border)",
+
+                    borderRadius: 99,
+
+                    padding: "6px 12px",
+
+                    fontSize: 12,
+
+                    fontWeight: 800,
+
+                    color: "var(--text-dim)",
+
+                    maxWidth: maxW,
+
+                    whiteSpace: "nowrap",
+
+                    overflow: "hidden",
+
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  <span
+                    style={{
+                      display: "flex",
+
+                      alignItems: "center",
+
+                      color: "var(--text-muted)",
+                    }}
+                  >
+                    {icon}
+                  </span>
+                  <span>
+                    {label}{" "}
+                    <span style={{ color: "var(--text-muted)" }}>{sub}</span>
+                  </span>
+                </span>
+              )
+
+              return (
+                <>
+                  {chip(<ArchiveIcon size={14} />, `${archiveClosed.length}`, "closed polls", 200)}
+                  {chip(<BallotIcon size={14} />, `${totalVotes}`, "votes cast", 180)}
+                  {top &&
+                    chip(<TrophyIcon size={14} />, top.question, `${top.votes.reduce((s, v) => s + v, 0)} votes`, 240)}
+                </>
+              )
+            })()}
+          </div>
+        )}
+
+        {loading && sorted.length === 0 ? (
           <div
             style={{
               textAlign: "center",
@@ -7286,15 +8524,22 @@ export default function App() {
         ) : sorted.length === 0 ? (
           <div
             style={{
-              textAlign: "center",
+              background:
+                "linear-gradient(160deg, var(--card-top) 0%, var(--card-bottom) 100%)",
 
-              padding: "60px 0",
+              border: "1px solid var(--border)",
+
+              borderRadius: 20,
+
+              padding: "44px 20px",
+
+              textAlign: "center",
 
               color: "var(--text-faint)",
             }}
           >
-            <p style={{ fontSize: 36, margin: "0 0 8px" }}>
-              {showMine ? "🗳️" : "🌱"}
+            <p style={{ fontSize: 36, margin: "0 0 10px" }}>
+              {archiveView ? "🕰️" : showMine ? "🗳️" : "🌱"}
             </p>
             <p
               style={{
@@ -7309,51 +8554,180 @@ export default function App() {
                 color: "var(--text-dim)",
               }}
             >
-              {showMine ? "No polls yet" : "Nothing here"}
+              {archiveView
+                ? "Nothing archived yet"
+                : showMine
+                  ? "No polls yet"
+                  : "Nothing here"}
             </p>
-            <p style={{ fontSize: 13, margin: 0, fontWeight: 600 }}>
-              {showMine
-                ? "Polls you post will show up here."
-                : search
-                  ? "Try a different search."
-                  : "Be the first to ask something."}
+            <p
+              style={{
+                fontSize: 13,
+
+                margin: "0 0 18px",
+
+                fontWeight: 600,
+              }}
+            >
+              {archiveView
+                ? search
+                  ? "No closed polls match that search."
+                  : "Polls stay live for a while — when they close, results land here."
+                : showMine
+                  ? "Polls you post will show up here."
+                  : search
+                    ? "Try a different search."
+                    : "Be the first to ask something."}
             </p>
+            {search && (
+              <button
+                onClick={() => setSearch("")}
+                style={{
+                  background: "var(--gradient)",
+
+                  border: "none",
+
+                  borderRadius: 10,
+
+                  padding: "9px 18px",
+
+                  color: "#fff",
+
+                  fontFamily: "Satoshi, sans-serif",
+
+                  fontWeight: 800,
+
+                  fontSize: 13,
+
+                  cursor: "pointer",
+
+                  boxShadow: "0 4px 18px var(--primary-glow-strong)",
+                }}
+              >
+                Clear search
+              </button>
+            )}
           </div>
         ) : (
           <div
             style={
               view === "grid"
                 ? {
-                    display: "grid",
+                    // Pure CSS masonry via multi-column flow: cards pack to
+                    // their own content height (height: auto) with no row
+                    // stretching and no JS column-height measurement. Columns
+                    // auto-fit the container width like the old grid did.
+                    columnWidth: isNarrow ? 168 : 300,
 
-                    gridTemplateColumns: isNarrow
-                      ? "repeat(auto-fill, minmax(158px, 1fr))"
-                      : "repeat(auto-fill, minmax(270px, 1fr))",
+                    columnGap: isNarrow ? 12 : 14,
 
-                    gap: 12,
+                    minWidth: 0,
+
+                    maxWidth: "100%",
                   }
-                : { display: "flex", flexDirection: "column", gap: 14 }
+                : {
+                    display: "flex",
+
+                    flexDirection: "column",
+
+                    gap: 16,
+
+                    minWidth: 0,
+
+                    maxWidth: "100%",
+                  }
             }
           >
-            {sorted.map((poll) => (
-              <PollCard
-                key={poll.id}
-                poll={poll}
-                now={now}
-                onVote={handleVote}
-                onComment={handleComment}
-                onLikeComment={handleLikeComment}
-                onRedditVote={handleRedditVote}
-                onReplyComment={handleReplyComment}
-                onShare={handleShare}
-                openComments={poll.id === openCommentsId}
-                compact={view === "grid" && isNarrow}
-                isAdmin={isAdmin}
-                onDelete={(id) =>
-                  setConfirmDelete(polls.find((p) => p.id === id) ?? null)
-                }
-              />
-            ))}
+            {sorted.map((poll, i) => {
+              const isNew = !feedSeenRef.current.has(poll.id)
+
+              return (
+                <div
+                  key={poll.id}
+                  style={{
+                    breakInside: "avoid",
+
+                    display: "inline-block",
+
+                    width: "100%",
+
+                    marginBottom:
+                      view === "grid" ? (isNarrow ? 12 : 14) : 0,
+                  }}
+                >
+                  <PollCard
+                    poll={poll}
+                    now={now}
+                    onVote={handleVote}
+                    onComment={handleComment}
+                    onLikeComment={handleLikeComment}
+                    onRedditVote={handleRedditVote}
+                    onReplyComment={handleReplyComment}
+                    onShare={handleShare}
+                    openComments={poll.id === openCommentsId}
+                    compact={view === "grid" && isNarrow}
+                    isAdmin={isAdmin}
+                    animateEnter={isNew}
+                    enterDelay={Math.min(i, 4) * 40}
+                    openResults={archiveView}
+                    bareResults={archiveView}
+                    isNarrow={isNarrow}
+                    onDelete={(id) =>
+                      setConfirmDelete(polls.find((p) => p.id === id) ?? null)
+                    }
+                  />
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {/* Infinite-scroll sentinel: invisible marker that triggers the next
+        page of older polls when it scrolls into view. A manual "Load more"
+        button is also rendered as a fallback (e.g. no IntersectionObserver). */}
+        {(hasMore || archiveHasMore) && (
+          <div ref={sentinelRef} style={{ height: 1, width: "100%" }} />
+        )}
+
+        {(hasMore || archiveHasMore) && (
+          <div
+            style={{
+              display: "flex",
+
+              justifyContent: "center",
+
+              padding: "16px 0 4px",
+            }}
+          >
+            <button
+              onClick={() => loadMoreRef.current()}
+              disabled={loadingMore || archiveLoadingMore}
+              style={{
+                background: "var(--surface-2)",
+
+                border: "1px solid var(--accent-soft)",
+
+                borderRadius: 10,
+
+                padding: "9px 18px",
+
+                color: "var(--accent)",
+
+                fontFamily: "Satoshi, sans-serif",
+
+                fontWeight: 800,
+
+                fontSize: 13,
+
+                cursor: loadingMore || archiveLoadingMore ? "wait" : "pointer",
+
+                transition: "all 0.15s",
+              }}
+            >
+              {loadingMore || archiveLoadingMore
+                ? "Loading…"
+                : "Load more polls"}
+            </button>
           </div>
         )}
 
@@ -7399,11 +8773,11 @@ export default function App() {
 
           background: "var(--bg-96)",
 
-          backdropFilter: "blur(16px)",
-
           borderTop: "1px solid var(--border)",
 
-          padding: "10px 16px 22px",
+          padding: isNarrow
+            ? "10px 16px calc(16px + env(safe-area-inset-bottom))"
+            : "10px 16px 22px",
 
           display: "flex",
 
@@ -7412,7 +8786,32 @@ export default function App() {
       >
         <button
           onClick={() => setShowModal(true)}
+          onPointerDown={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect()
+
+            addCtaRipple(e.clientX - rect.left, e.clientY - rect.top)
+
+            if (e.pointerType === "touch") playCreateSound()
+          }}
+          onMouseMove={(e) => {
+            if (!window.matchMedia("(hover: hover)").matches) return
+
+            const el = ctaFollowerRef.current
+
+            if (el) {
+              el.style.left = `${e.clientX - e.currentTarget.getBoundingClientRect().left}px`
+
+              el.style.top = `${e.clientY - e.currentTarget.getBoundingClientRect().top}px`
+
+              el.classList.add("on")
+            }
+          }}
+          onMouseLeave={() => ctaFollowerRef.current?.classList.remove("on")}
           style={{
+            position: "relative",
+
+            overflow: "hidden",
+
             background: "var(--gradient-cta)",
 
             border: "none",
@@ -7435,12 +8834,59 @@ export default function App() {
 
             width: "100%",
 
-            boxShadow: "0 4px 28px var(--primary-glow-strong)",
+            boxShadow: "0 4px 18px var(--primary-glow)",
 
             letterSpacing: "0.01em",
           }}
         >
-          {CTA_PHRASES[ctaIndex]}
+          <div
+            ref={ctaFollowerRef}
+            className="cta-follower"
+            style={{
+              width: 240,
+
+              height: 240,
+
+              marginLeft: -120,
+
+              marginTop: -120,
+
+              left: "50%",
+
+              top: "50%",
+            }}
+          />
+          {ripples.map((r) => (
+            <span
+              key={r.id}
+              className="ripple"
+              style={{
+                left: r.x,
+
+                top: r.y,
+
+                width: 180,
+
+                height: 180,
+              }}
+            />
+          ))}
+          <span
+            style={{
+              position: "relative",
+
+              display: "flex",
+
+              alignItems: "center",
+
+              justifyContent: "center",
+
+              gap: 8,
+            }}
+          >
+            <SproutIcon size={17} />
+            {CTA_PHRASES[ctaIndex]}
+          </span>
         </button>
       </div>
 
@@ -7454,7 +8900,11 @@ export default function App() {
       {welcomeOpen && (
         <WelcomeModal
           onClose={() => {
-            localStorage.setItem("bageecha-welcomed", "1")
+            try {
+              localStorage.setItem("bageecha-welcomed", "1")
+            } catch {
+              /* storage unavailable — welcome may show again */
+            }
 
             setWelcomeOpen(false)
           }}
@@ -7658,7 +9108,7 @@ export default function App() {
                     cursor: "pointer",
                   }}
                 >
-                  🗃️ Archive instead
+                  <ArchiveIcon size={15} /> Archive instead
                 </button>
               )}
               <button
@@ -7685,7 +9135,7 @@ export default function App() {
                   cursor: "pointer",
                 }}
               >
-                🗑️ Delete permanently
+                <TrashIcon size={15} /> Delete permanently
               </button>
               <button
                 onClick={() => setConfirmDelete(null)}
