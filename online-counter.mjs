@@ -21,6 +21,17 @@ export function onlineCounterMiddleware(req, res, next) {
   // (e.g. /Bageecha/api/online in dev/preview deployments).
   if (!pathname.endsWith("/api/online")) return next()
 
+  // Reject before writing any headers: calling writeHead after the 200 below
+  // throws ERR_HTTP_HEADERS_SENT, and a heartbeat interval created earlier
+  // would leak and keep running forever.
+  if (clients.size >= MAX_CLIENTS) {
+    res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" })
+
+    res.end("Online counter at capacity")
+
+    return
+  }
+
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -37,13 +48,6 @@ export function onlineCounterMiddleware(req, res, next) {
         /* ignore */
       }
     }, pingInterval),
-  }
-  if (clients.size >= MAX_CLIENTS) {
-    res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" })
-
-    res.end("Online counter at capacity")
-
-    return
   }
 
   clients.add(client)

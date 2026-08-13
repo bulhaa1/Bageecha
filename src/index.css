@@ -316,6 +316,47 @@ body::before {
   animation: tide 6s linear infinite;
 }
 
+/* Living underline below search + sort + category: a gradient that sweeps
+   left-to-right while the whole line breathes with the theme colors */
+.filter-line {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--primary) 40%, transparent) 18%,
+    color-mix(in srgb, #ffffff 78%, var(--primary)) 50%,
+    color-mix(in srgb, var(--accent) 40%, transparent) 82%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  background-position: 0% 0;
+  animation: tide 7s linear infinite, line-glow 3.4s ease-in-out infinite;
+  box-shadow: 0 0 10px var(--primary-glow), 0 0 24px var(--primary-glow),
+    0 0 44px color-mix(in srgb, var(--primary) 30%, transparent);
+}
+
+@keyframes line-glow {
+  0%, 100% { opacity: 0.55; filter: brightness(1); }
+  50% { opacity: 1; filter: brightness(1.35); }
+}
+
+/* New-poll box: a breathing neon ring while you're composing inside it */
+.create-poll-glow:focus-within {
+  animation: create-glow 3.4s ease-in-out infinite;
+}
+
+@keyframes create-glow {
+  0%, 100% {
+    box-shadow: 0 -24px 60px var(--purple-glow),
+      0 0 0 2px color-mix(in srgb, var(--primary) 28%, transparent),
+      0 0 18px var(--primary-glow-strong), 0 0 40px var(--primary-glow);
+  }
+  50% {
+    box-shadow: 0 -24px 60px var(--purple-glow),
+      0 0 0 3px color-mix(in srgb, var(--primary) 55%, transparent),
+      0 0 32px var(--primary-glow-strong), 0 0 64px var(--primary-glow);
+  }
+}
+
 @keyframes tide {
   from { background-position: 0% 0; }
   to { background-position: 200% 0; }
@@ -333,10 +374,14 @@ body::before {
 @media (prefers-reduced-motion: reduce) {
   .pulse-dot,
   .tide-line,
+  .filter-line,
+  .create-poll-glow:focus-within,
   .toast-pop,
   .donut-seg,
   .donut-winner,
-  .card-enter {
+  .card-enter,
+  .stage-hint,
+  .vote-stage-glow::after {
     animation: none;
     transition: none;
   }
@@ -415,6 +460,40 @@ body::before {
   pointer-events: none;
 }
 
+/* Two-tap voting: staged option glows softly until the second tap locks it */
+.vote-stage-glow {
+  background: linear-gradient(
+    105deg,
+    transparent 28%,
+    color-mix(in srgb, var(--primary) 22%, transparent) 52%,
+    transparent 74%
+  );
+}
+
+.stage-hint {
+  animation: stage-hint-in 0.28s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes stage-hint-in {
+  from { transform: scale(0.7); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+/* Reassurance pulse on the staged option — gently repeats, never distracting */
+.vote-stage-glow::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  animation: stage-pulse 1.6s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes stage-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 0.15; }
+}
+
 /* Continuity: live-arriving cards rise into the feed */
 .card-enter {
   animation: card-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) backwards;
@@ -425,9 +504,14 @@ body::before {
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
-/* Up/down vote buttons press down */
+/* Press feedback for the poll options. Deliberately does NOT scale the
+   element: on iOS the :active state is held through the tap, so scaling the
+   button shrinks its hit box and a tap landing near the edge ends up outside
+   it — the browser then drops the synthesized click (animation plays, but the
+   vote never registers). Opacity gives feedback without moving the box. */
 .press-pop:active {
-  transform: scale(0.82);
+  transform: none;
+  opacity: 0.85;
 }
 
 /* Tap burst: a ripple that expands from the touch/click point */
@@ -472,4 +556,27 @@ body::before {
 :focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
+}
+
+/* Animated logo: the theme gradient flows continuously right to left across
+   the wordmark. background-size 200% + position 0%→200% makes the loop
+   visually seamless while colors drift leftward. */
+.logo-flow {
+  background-size: 200% auto;
+  animation: gradient-flow 5s linear infinite;
+}
+
+@keyframes gradient-flow {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 200% 50%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .logo-flow {
+    animation: none;
+  }
 }

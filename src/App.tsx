@@ -1,4 +1,13 @@
-import { useState, useEffect, useRef, useMemo, useLayoutEffect, type ReactNode, type CSSProperties } from "react"
+import {
+  useState,
+  useEffect,
+  useRef,
+  useMemo,
+  useLayoutEffect,
+  Fragment,
+  type ReactNode,
+  type CSSProperties,
+} from "react"
 
 import {
   collection,
@@ -89,6 +98,12 @@ const playVoteSound = () => {
   setTimeout(() => playTone(783.99, 0.09, "triangle", 0.12), 60)
 }
 
+// Subtle tick for the first (staging) tap on an option — a soft confirmation
+// that the choice was selected, before the louder two-note "locked" jingle.
+const playStageSound = () => {
+  playTone(660, 0.05, "sine", 0.09)
+}
+
 const playCreateSound = () => {
   playTone(440, 0.08, "sine", 0.16)
 
@@ -116,6 +131,8 @@ const encodeShare = (poll: Poll) => {
     description: poll.description,
 
     category: poll.category,
+
+    tags: poll.tags,
 
     author: poll.author,
 
@@ -198,6 +215,8 @@ interface Poll {
 
   category: string
 
+  tags: string[]
+
   author: string
 
   creatorId?: string
@@ -247,7 +266,9 @@ type RawComment = RawReply & {
   replies?: Record<string, RawReply>
 }
 
-type RawPoll = Omit<Poll, "voted" | "userVote" | "comments"> & {
+type RawPoll = Omit<Poll, "voted" | "userVote" | "comments" | "tags"> & {
+  tags?: string[]
+
   comments?: Record<string, RawComment>
 }
 
@@ -261,10 +282,93 @@ const MAX_OPTIONS = 7
 
 const MIN_OPTIONS = 2
 
-const DURATION_CHOICES = [6, 12, 24, 48] as const
+const DURATION_CHOICES = [4, 6, 12, 24, 48] as const
 
 const pollLifetimeMs = (d: { durationH?: number }) =>
   (d.durationH ?? 48) * 60 * 60 * 1000
+
+// Format the moment a closed poll's voting ended, e.g. "Aug 13, 6:30 PM".
+const formatPollEnd = (ms: number) =>
+  new Date(ms).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  })
+
+// Tag normalization: tags are stored lowercase with trimmed, single-spaced
+
+// text, so "Gaming", "gaming" and "GAMING" all resolve to the same reusable
+
+// tag. Whitespace-only input produces an empty tag (never stored). Spaces are
+
+// stripped entirely, so a tag is always a single unbroken token.
+
+const normalizeTag = (s: string) => s.trim().replace(/\s+/g, "").toLowerCase()
+
+// Tag sanitization: strips control characters, zero-width/format chars and
+
+// emoji so gibberish and invisible-character spam can't create look-alike or
+
+// junk tags. Keeps letters, digits and a small safe punctuation set.
+
+const TAG_ALLOWED = /[^a-z0-9#.+&'_-]/gi
+
+const sanitizeTag = (s: string) => normalizeTag(s).replace(TAG_ALLOWED, "")
+
+const MAX_TAGS = 3
+
+const TAG_MAX_LEN = 20
+
+const titleCase = (s: string) =>
+  s ? s.charAt(0).toUpperCase() + s.slice(1) : s
+
+// Resolve a category/tag string to a canonical known-category key so legacy
+
+// "Food"-style values keep their accent even when stored lowercase as tags.
+
+const resolveCategoryKey = (cat: string) =>
+  Object.keys(CATEGORY_META).find(
+    (k) => k.toLowerCase() === String(cat).toLowerCase(),
+  ) ?? cat
+
+// Derive the effective tag list for a raw poll: stored tags win, the legacy
+
+// free-text `category` is folded in as a tag so pre-tag posts stay usable.
+
+const deriveTags = (d: { tags?: string[]; category?: string }): string[] => {
+  const set = new Set(
+    (Array.isArray(d.tags) ? d.tags : [])
+
+      .map((t) => normalizeTag(String(t)))
+
+      .filter((t) => t !== ""),
+  )
+
+  if (d.category) {
+    const c = normalizeTag(d.category)
+
+    if (c !== "") set.add(c)
+  }
+
+  return [...set]
+}
+
+// Pick a display category for old `category`-style accents from the tag list:
+
+// the first tag matching a known category wins (keeps its Famous accent),
+
+// otherwise the first tag is title-cased as the label.
+
+const deriveCategory = (tags: string[]): string => {
+  if (!tags || tags.length === 0) return "General"
+
+  const known = tags.map(resolveCategoryKey).find((t) => t in CATEGORY_META)
+
+  if (known) return known
+
+  return titleCase(tags[0])
+}
 
 const fmtTimeAgo = (createdAt: number, now: number): string => {
   const diff = Math.max(0, now - createdAt)
@@ -418,6 +522,12 @@ const toRawPoll = (poll: Poll, anonId: string): RawPoll => ({
 
   category: poll.category,
 
+  tags: poll.tags?.length
+    ? poll.tags
+    : poll.category
+      ? [normalizeTag(poll.category)]
+      : [],
+
   author: poll.author,
 
   creatorId: poll.creatorId ?? "",
@@ -501,7 +611,9 @@ const toViewPoll = (
 
     description: d.description,
 
-    category: d.category || "General",
+    category: deriveCategory(d.tags?.length ? d.tags : deriveTags(d)),
+
+    tags: deriveTags(d),
 
     author: d.author,
 
@@ -568,7 +680,9 @@ const toViewPoll = (
 }
 
 // Merge two raw-poll arrays by id, deduplicating. The first array wins on
+
 // conflicts (its caller passes the fresher window first).
+
 const mergeRawById = (a: RawPoll[], b: RawPoll[]): RawPoll[] => {
   const byId = new Map<string, RawPoll>()
 
@@ -580,12 +694,18 @@ const mergeRawById = (a: RawPoll[], b: RawPoll[]): RawPoll[] => {
 }
 
 // Live-window shift handling: when new polls push the oldest window doc out
+
 // of the snapshot, it is not deleted — it just left the query window. Verify
+
 // with a cheap getDoc: if it still exists, absorb it into the paginated pile
+
 // so it stays visible; if it's gone (admin delete), let it drop.
+
 const absorbWindowShift = (
   prevWindowRef: { current: Set<string> },
+
   newDocs: { id: string }[],
+
   setter: (fn: (prev: RawPoll[]) => RawPoll[]) => void,
 ) => {
   const newIds = new Set(newDocs.map((d) => d.id))
@@ -601,13 +721,17 @@ const absorbWindowShift = (
   if (dropped.length === 0) return
 
   Promise.all(dropped.map((id) => getDoc(doc(db, "polls", id))))
+
     .then((results) => {
       const surviving = results
+
         .filter((s) => s.exists())
+
         .map((s) => s.data() as RawPoll)
 
       if (surviving.length > 0) setter((prev) => mergeRawById(prev, surviving))
     })
+
     .catch(() => {
       /* drop the shifted-out docs on network error */
     })
@@ -750,21 +874,36 @@ const NEUTRAL_CATEGORY_META = {
 }
 
 // Darker versions of each category accent for light themes, where the vivid
+
 // dark-theme hues don't have enough contrast against white surfaces.
+
 const LIGHT_CATEGORY_TEXT: Record<string, string> = {
   Food: "#c2255c",
+
   Transport: "#0e7490",
+
   Lifestyle: "#a16207",
+
   "Hot Take": "#be185d",
+
   Community: "#6d28d9",
+
   Sports: "#0f766e",
+
   Politics: "#c2410c",
+
   Tech: "#1d4ed8",
+
   Music: "#a21caf",
+
   Dating: "#b91c1c",
+
   Environment: "#15803d",
+
   Fashion: "#c2458f",
+
   General: "#6b5ea8",
+
   Controversial: "#be123c",
 }
 
@@ -772,7 +911,7 @@ const categoryMeta = (cat: string) => {
   const meta = {
     ...NEUTRAL_CATEGORY_META,
 
-    ...CATEGORY_META[cat as keyof typeof CATEGORY_META],
+    ...CATEGORY_META[(resolveCategoryKey(cat) as keyof typeof CATEGORY_META)],
   }
 
   const isLight =
@@ -781,7 +920,7 @@ const categoryMeta = (cat: string) => {
 
   if (!isLight) return meta
 
-  const light = LIGHT_CATEGORY_TEXT[cat]
+  const light = LIGHT_CATEGORY_TEXT[resolveCategoryKey(cat)]
 
   if (light) {
     meta.text = light
@@ -798,7 +937,7 @@ const categoryMeta = (cat: string) => {
   return meta
 }
 
-const INITIAL_POLLS: Omit<Poll, "createdAt" | "votes" | "upvotes" | "downvotes" | "userVote">[] =
+const INITIAL_POLLS: Omit<Poll, "createdAt" | "votes" | "upvotes" | "downvotes" | "userVote" | "tags">[] =
   [
     {
       id: "1",
@@ -1194,16 +1333,6 @@ interface FilterOption {
   value: "all" | string
 }
 
-const ALL_FILTERS: FilterOption[] = [
-  { label: "All", value: "all" },
-
-  ...(Object.keys(CATEGORY_META) as Category[]).map((c) => ({
-    label: c,
-
-    value: c as "all" | Category,
-  })),
-]
-
 interface ThemeOption {
   id: string
 
@@ -1216,7 +1345,7 @@ const THEMES: ThemeOption[] = [
   {
     id: "neon",
 
-    name: "Neon",
+    name: "Dhanvaru",
 
     swatch: ["#ff2d78", "#b57bff", "#00e5ff"],
   },
@@ -1224,7 +1353,7 @@ const THEMES: ThemeOption[] = [
   {
     id: "ocean",
 
-    name: "Ocean",
+    name: "Kandu",
 
     swatch: ["#38bdf8", "#818cf8", "#22d3ee"],
   },
@@ -1232,7 +1361,7 @@ const THEMES: ThemeOption[] = [
   {
     id: "forest",
 
-    name: "Forest",
+    name: "Jangali",
 
     swatch: ["#4ade80", "#2dd4bf", "#a3e635"],
   },
@@ -1240,7 +1369,7 @@ const THEMES: ThemeOption[] = [
   {
     id: "sunset",
 
-    name: "Sunset",
+    name: "Finifenma",
 
     swatch: ["#fb7185", "#f472b6", "#fbbf24"],
   },
@@ -1248,7 +1377,7 @@ const THEMES: ThemeOption[] = [
   {
     id: "graphite",
 
-    name: "Graphite",
+    name: "Vaarey",
 
     swatch: ["#60a5fa", "#94a3b8", "#a5b4fc"],
   },
@@ -1256,7 +1385,7 @@ const THEMES: ThemeOption[] = [
   {
     id: "dawn",
 
-    name: "Dawn",
+    name: "Handhu",
 
     swatch: ["#e11d74", "#7c3aed", "#0891b2"],
   },
@@ -1568,29 +1697,6 @@ function BoltIcon({ size = 16 }: { size?: number }) {
   )
 }
 
-function TrophyIcon({ size = 16 }: { size?: number }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      width={size}
-      height={size}
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      style={{ display: "block" }}
-    >
-      <path d="M6 4.5h12v4a6 6 0 0 1-12 0z" />
-      <path d="M6 6H3.8a1.9 1.9 0 0 0 1.9 2.6H6" />
-      <path d="M18 6h2.2a1.9 1.9 0 0 1-1.9 2.6H18" />
-      <path d="M12 14.5v3" />
-      <path d="M8.5 20.5h7" />
-    </svg>
-  )
-}
-
 function BallotIcon({ size = 16 }: { size?: number }) {
   return (
     <svg
@@ -1718,14 +1824,23 @@ function SproutIcon({ size = 16 }: { size?: number }) {
 function CategoryIcon({ cat, size = 14 }: { cat: string; size?: number }) {
   const p = {
     viewBox: "0 0 24 24",
+
     width: size,
+
     height: size,
+
     fill: "none",
+
     stroke: "currentColor",
+
     strokeWidth: 1.8,
+
     strokeLinecap: "round",
+
     strokeLinejoin: "round",
+
     "aria-hidden": true,
+
     style: { display: "block" },
   } as const
 
@@ -1845,98 +1960,186 @@ function CategoryIcon({ cat, size = 14 }: { cat: string; size?: number }) {
   }
 }
 
-function ThemePicker({
-  theme,
+function UserMenu({
+  isAdmin,
 
-  onChange,
+  userEmail,
 
-  compact,
+  onMyPolls,
+
+  onRules,
+
+  onSignIn,
+
+  onSignOut,
 }: {
-  theme: string
+  isAdmin: boolean
 
-  onChange: (t: string) => void
+  userEmail?: string | null
 
-  compact?: boolean
+  onMyPolls: () => void
+
+  onRules: () => void
+
+  onSignIn: () => void
+
+  onSignOut: () => void
 }) {
   const [open, setOpen] = useState(false)
+
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  const btnRef = useRef<HTMLButtonElement>(null)
+
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  const close = () => setOpen(false)
+
+  // Close on outside mousedown and on Escape (Escape also returns focus to
+
+  // the trigger so keyboard users re-enter the flow where they left off).
 
   useEffect(() => {
     if (!open) return
 
-    const close = () => setOpen(false)
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node))
+        close()
+    }
 
-    window.addEventListener("click", close)
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        close()
 
-    return () => window.removeEventListener("click", close)
+        btnRef.current?.focus()
+      }
+    }
+
+    window.addEventListener("mousedown", onDown)
+
+    window.addEventListener("keydown", onKey)
+
+    return () => {
+      window.removeEventListener("mousedown", onDown)
+
+      window.removeEventListener("keydown", onKey)
+    }
   }, [open])
 
+  // Focus the first actionable item when the menu opens.
+
+  useEffect(() => {
+    if (!open) return
+
+    const t = requestAnimationFrame(() => {
+      const first =
+        menuRef.current?.querySelector<HTMLButtonElement>(
+          '[role="menuitem"]',
+        )
+
+      first?.focus()
+    })
+
+    return () => cancelAnimationFrame(t)
+  }, [open])
+
+  const focusAt = (idx: number) => {
+    const items =
+      menuRef.current?.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitem"]',
+      )
+
+    if (!items || items.length === 0) return
+
+    const el = items[(idx + items.length) % items.length]
+
+    el?.focus()
+  }
+
+  const onMenuKeyDown = (e: React.KeyboardEvent) => {
+    const items = Array.from(
+      menuRef.current?.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitem"]',
+      ) ?? [],
+    )
+
+    const idx = items.indexOf(e.target as HTMLButtonElement)
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault()
+
+      focusAt(idx + 1)
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault()
+
+      focusAt(idx - 1)
+    } else if (e.key === "Home") {
+      e.preventDefault()
+
+      focusAt(0)
+    } else if (e.key === "End") {
+      e.preventDefault()
+
+      focusAt(items.length - 1)
+    }
+  }
+
   return (
-    <div style={{ position: "relative" }}>
+    <div ref={rootRef} style={{ position: "relative" }}>
       <button
+        ref={btnRef}
         onClick={(e) => {
           e.stopPropagation()
 
           setOpen(!open)
         }}
-        title="Color theme"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={
+          isAdmin && userEmail ? `Account: ${userEmail}` : "User menu"
+        }
+        title={isAdmin && userEmail ? `Signed in as ${userEmail}` : "User menu"}
         style={{
           display: "flex",
 
           alignItems: "center",
 
-          gap: 5,
+          justifyContent: "center",
 
-          background: "var(--surface)",
+          background: open ? "var(--surface-2)" : "var(--surface)",
 
-          border: "1px solid var(--border)",
+          border: open
+            ? "1px solid var(--primary-soft)"
+            : "1px solid var(--border)",
 
-          borderRadius: 9,
+          borderRadius: 10,
 
-          padding: compact ? "0 12px" : "0 14px",
+          height: 40,
 
-          height: compact ? 40 : 36,
+          minWidth: 40,
 
-          color: "var(--text-dim)",
-
-          fontSize: 12,
-
-          fontWeight: 800,
+          padding: 0,
 
           lineHeight: 1,
 
-          fontFamily: "Satoshi, sans-serif",
+          color: open ? "var(--primary)" : "var(--text-dim)",
 
           cursor: "pointer",
 
           transition: "all 0.15s",
         }}
       >
-        <span style={{ display: "inline-flex", gap: 2 }}>
-          {(THEMES.find((t) => t.id === theme)?.swatch ?? THEMES[0].swatch).map(
-            (c, i) => (
-              <span
-                key={i}
-                style={{
-                  width: compact ? 8 : 7,
-
-                  height: compact ? 8 : 7,
-
-                  borderRadius: "50%",
-
-                  background: c,
-
-                  display: "inline-block",
-                }}
-              />
-            ),
-          )}
-        </span>
-        {!compact && <span>Theme</span>}
+        <PersonIcon size={19} />
       </button>
 
       {open && (
         <div
+          ref={menuRef}
+          role="menu"
+          aria-label="User menu"
+          onKeyDown={onMenuKeyDown}
           onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
           style={{
             position: "absolute",
 
@@ -1952,98 +2155,271 @@ function ThemePicker({
 
             borderRadius: 14,
 
-            padding: 8,
+            padding: 5,
 
-            width: 170,
+            width: 188,
 
             boxShadow: "0 16px 40px rgba(0,0,0,0.5)",
           }}
         >
-          {THEMES.map((t) => {
-            const active = theme === t.id
+          <button
+            role="menuitem"
+            onClick={() => {
+              onMyPolls()
 
-            return (
-              <button
-                key={t.id}
-                onClick={() => {
-                  onChange(t.id)
+              close()
+            }}
+            style={{
+              display: "flex",
 
-                  setOpen(false)
-                }}
+              alignItems: "center",
+
+              gap: 8,
+
+              width: "100%",
+
+              background: "transparent",
+
+              border: "none",
+
+              borderRadius: 8,
+
+              padding: "7px 10px",
+
+              color: "var(--text-dim)",
+
+              fontFamily: "Satoshi, sans-serif",
+
+              fontWeight: 700,
+
+              fontSize: 12.5,
+
+              textAlign: "left",
+
+              cursor: "pointer",
+
+              transition: "background 0.15s, color 0.15s",
+            }}
+          >
+            <PersonIcon size={15} />
+            My polls
+          </button>
+          <button
+            role="menuitem"
+            onClick={() => {
+              onRules()
+
+              close()
+            }}
+            style={{
+              display: "flex",
+
+              alignItems: "center",
+
+              gap: 8,
+
+              width: "100%",
+
+              background: "transparent",
+
+              border: "none",
+
+              borderRadius: 8,
+
+              padding: "7px 10px",
+
+              color: "var(--text-dim)",
+
+              fontFamily: "Satoshi, sans-serif",
+
+              fontWeight: 700,
+
+              fontSize: 12.5,
+
+              textAlign: "left",
+
+              cursor: "pointer",
+
+              transition: "background 0.15s, color 0.15s",
+            }}
+          >
+            <RulesIcon size={15} />
+            Rules
+          </button>
+
+          <div
+            style={{
+              borderTop: "1px solid var(--border)",
+
+              marginTop: 3,
+
+              paddingTop: 3,
+            }}
+          >
+            <button
+              role="menuitem"
+              onClick={() => {
+                if (isAdmin) onSignOut()
+                else onSignIn()
+
+                close()
+              }}
+              style={{
+                display: "flex",
+
+                alignItems: "center",
+
+                gap: 8,
+
+                width: "100%",
+
+                background: "transparent",
+
+                border: "none",
+
+                borderRadius: 8,
+
+                padding: "7px 10px",
+
+                color: isAdmin ? "var(--accent)" : "var(--text-dim)",
+
+                fontFamily: "Satoshi, sans-serif",
+
+                fontWeight: 700,
+
+                fontSize: 12.5,
+
+                textAlign: "left",
+
+                cursor: "pointer",
+
+                transition: "background 0.15s, color 0.15s",
+              }}
+            >
+              <KeyIcon size={15} />
+              <span
                 style={{
                   display: "flex",
 
                   alignItems: "center",
 
-                  gap: 10,
+                  gap: 6,
 
-                  width: "100%",
-
-                  background: active ? "var(--primary-soft-bg)" : "transparent",
-
-                  border: active
-                    ? "1px solid var(--primary-soft)"
-                    : "1px solid transparent",
-
-                  borderRadius: 9,
-
-                  padding: "7px 10px",
-
-                  cursor: "pointer",
-
-                  fontFamily: "Satoshi, sans-serif",
-
-                  textAlign: "left",
-
-                  transition: "all 0.15s",
+                  minWidth: 0,
                 }}
               >
-                <span style={{ display: "inline-flex", gap: 2 }}>
-                  {t.swatch.map((c, i) => (
-                    <span
-                      key={i}
-                      style={{
-                        width: 8,
-
-                        height: 8,
-
-                        borderRadius: "50%",
-
-                        background: c,
-
-                        display: "inline-block",
-                      }}
-                    />
-                  ))}
+                <span style={{ flexShrink: 0 }}>
+                  {isAdmin ? "Sign out" : "Admin sign-in"}
                 </span>
-                <span
-                  style={{
-                    fontSize: 13,
-
-                    fontWeight: 800,
-
-                    color: "var(--text)",
-                  }}
-                >
-                  {t.name}
-                </span>
-                {active && (
+                {isAdmin && userEmail && (
                   <span
                     style={{
-                      marginLeft: "auto",
+                      fontSize: 10,
 
-                      color: "var(--primary)",
+                      fontWeight: 600,
 
-                      fontSize: 12,
+                      opacity: 0.7,
+
+                      overflow: "hidden",
+
+                      textOverflow: "ellipsis",
+
+                      whiteSpace: "nowrap",
                     }}
                   >
-                    ✓
+                    {userEmail}
                   </span>
                 )}
-              </button>
-            )
-          })}
+              </span>
+            </button>
+          </div>
         </div>
+      )}
+    </div>
+  )
+}
+
+const FEED_SORTS = [
+  { value: "trending", label: "Trending", Icon: TrendingUpIcon },
+
+  { value: "popular", label: "Popular", Icon: StarIcon },
+
+  { value: "newest", label: "Newest", Icon: ClockIcon },
+
+  { value: "mostVoted", label: "Most Voted", Icon: ChartIcon },
+] as const
+
+function CharCounter({
+  length,
+
+  max,
+
+  id,
+
+  float = false,
+}: {
+  length: number
+
+  max: number
+
+  id?: string
+
+  float?: boolean
+}) {
+  const at = length >= max
+
+  const near = length >= Math.floor(max * 0.85) && !at
+
+  const color = at
+    ? "var(--accent)"
+    : near
+      ? "var(--primary)"
+      : "var(--text-faint)"
+
+  return (
+    <div
+      id={id}
+      role="status"
+      aria-live="polite"
+      aria-label={`${length} of ${max} characters${
+        at ? ", maximum reached" : ""
+      }`}
+      style={{
+        display: "flex",
+
+        alignItems: "center",
+
+        justifyContent: "flex-end",
+
+        gap: 8,
+
+        marginTop: float ? 0 : 5,
+
+        fontSize: 11,
+
+        fontWeight: at ? 900 : 700,
+
+        color,
+
+        fontVariantNumeric: "tabular-nums",
+
+        position: float ? "absolute" : "static",
+
+        right: float ? 10 : undefined,
+
+        bottom: float ? 8 : undefined,
+
+        pointerEvents: float ? "none" : undefined,
+      }}
+    >
+      <span>
+        {length} / {max}{" "}
+        <span style={{ fontWeight: 600, opacity: 0.85 }}>characters</span>
+      </span>
+      {(near || at) && (
+        <span style={{ opacity: at ? 1 : 0.8 }}>
+          {at ? "• Maximum reached" : "• Getting close to the limit"}
+        </span>
       )}
     </div>
   )
@@ -2136,9 +2512,36 @@ function PollCard({
 
   const [entered, setEntered] = useState(false)
 
+  // Two-tap voting: first tap stages an option (nothing written yet), second
+  // tap on the same option locks it in. Lets a misclick be corrected before
+  // the vote ever reaches the server.
+  const [staged, setStaged] = useState<number | null>(null)
+
+  const [rip, setRip] = useState<{ i: number; x: number; y: number } | null>(
+    null,
+  )
+
+  const popRipple = (i: number, e: React.MouseEvent<HTMLButtonElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+
+    const hb = { i, x: e.clientX - rect.left, y: e.clientY - rect.top }
+
+    window.setTimeout(
+      () => setRip((prev) => (prev === hb ? null : prev)),
+      650,
+    )
+
+    setRip(hb)
+  }
+
+  const live = !poll.expired && poll.voted === null
+
   // Entrance animation is strictly one-shot: once it has played (delay +
+
   // duration), the class is removed so no re-render, reorder, or re-sort can
+
   // ever restart it. Card positions settle and stay put.
+
   useEffect(() => {
     if (!animateEnter || entered) return
 
@@ -2153,6 +2556,7 @@ function PollCard({
 
   useEffect(() => {
     if (!hovering) return
+
     const iv = setInterval(() => setNowT(Date.now()), 1000)
 
     return () => clearInterval(iv)
@@ -2186,7 +2590,9 @@ function PollCard({
   const handleComment = () => {
     if (commentText.trim()) {
       // Only clear the input when the write was accepted (a pending
+
       // previous write leaves the text in place so nothing is lost).
+
       if (onComment(poll.id, commentText.trim())) setCommentText("")
     }
   }
@@ -2204,9 +2610,7 @@ function PollCard({
   return (
     <div
       id={`poll-card-${poll.id}`}
-      className={
-        "card-hover" + (animating ? " card-enter" : "")
-      }
+      className={"card-hover" + (animating ? " card-enter" : "")}
       onMouseEnter={() => setHovering(true)}
       onMouseLeave={() => setHovering(false)}
       style={{
@@ -2250,33 +2654,44 @@ function PollCard({
             flexWrap: "wrap",
           }}
         >
-          <span
-            className="tag-pill"
-            style={{
-              background: meta.bg,
+          {poll.tags.map((t) => {
+            const m = categoryMeta(t)
 
-              color: meta.text,
+            const known = resolveCategoryKey(t) in CATEGORY_META
 
-              padding: "3px 10px",
+            return (
+              <span
+                key={t}
+                className="tag-pill"
+                style={{
+                  background: m.bg,
 
-              borderRadius: 99,
+                  color: m.text,
 
-              border: `1px solid ${meta.border}`,
-            }}
-          >
-            <span
-              style={{
-                display: "inline-flex",
+                  padding: "3px 10px",
 
-                alignItems: "center",
+                  borderRadius: 99,
 
-                gap: 5,
-              }}
-            >
-              <CategoryIcon cat={poll.category} size={12} />
-              {poll.category}
-            </span>
-          </span>
+                  border: `1px solid ${m.border}`,
+                }}
+              >
+                <span
+                  style={{
+                    display: "inline-flex",
+
+                    alignItems: "center",
+
+                    gap: 5,
+                  }}
+                >
+                  {known && (
+                    <CategoryIcon cat={resolveCategoryKey(t)} size={12} />
+                  )}
+                  {titleCase(t)}
+                </span>
+              </span>
+            )
+          })}
           {!compact && poll.hot && (
             <span
               className="tag-pill"
@@ -2445,132 +2860,211 @@ function PollCard({
                   gap: 5,
                 }}
               >
-                <FlagIcon size={13} /> This poll closed after {poll.durationH ?? 48}h — voting is
-                done.
+                <FlagIcon size={13} /> This poll closed after{" "}
+                {poll.durationH ?? 48}h — voting is done.
               </p>
             )}
-          {poll.options.map((label, i) => {
-            const pct = pctOf(i)
+            {poll.options.map((label, i) => {
+              const pct = pctOf(i)
 
-            const isVoted = poll.voted === i
+              const isVoted = poll.voted === i
 
-            const didVote = poll.voted !== null
+              const didVote = poll.voted !== null
 
-            const barColor = "var(--primary)"
+              const isStaged = live && staged === i
 
-            const votedGlow =
-              barColor === "var(--primary)"
-                ? "var(--primary-glow)"
-                : barColor === "var(--accent)"
-                  ? "var(--accent-glow)"
-                  : `${barColor}55`
+              const clickable = live
 
-            const barBg =
-              barColor === "var(--primary)"
-                ? "var(--vote-bar-a)"
-                : barColor === "var(--accent)"
-                  ? "var(--vote-bar-b)"
-                  : `${barColor}22`
+              const barColor = "var(--primary)"
 
-            return (
-              <button
-                key={i}
-                onClick={() => !didVote && !poll.expired && onVote(poll.id, i)}
-                style={{
-                  position: "relative",
+              const votedGlow =
+                barColor === "var(--primary)"
+                  ? "var(--primary-glow)"
+                  : barColor === "var(--accent)"
+                    ? "var(--accent-glow)"
+                    : `${barColor}55`
 
-                  width: "100%",
+              const barBg =
+                barColor === "var(--primary)"
+                  ? "var(--vote-bar-a)"
+                  : barColor === "var(--accent)"
+                    ? "var(--vote-bar-b)"
+                    : `${barColor}22`
 
-                  padding: compact ? "8px 10px" : "11px 14px",
+              return (
+                <button
+                  key={i}
+                  onClick={(e) => {
+                    if (!live) return
 
-                  borderRadius: 11,
+                    popRipple(i, e)
 
-                  border: isVoted
-                    ? `2px solid ${barColor}`
-                    : `2px solid var(--border-strong)`,
+                    if (staged === i) {
+                      setStaged(null)
 
-                  background: "var(--bg)",
+                      playVoteSound()
 
-                  cursor: didVote || poll.expired ? "default" : "pointer",
+                      onVote(poll.id, i)
+                    } else {
+                      playStageSound()
 
-                  overflow: "hidden",
-
-                  textAlign: "left",
-
-                  transition: "border-color 0.2s, box-shadow 0.2s",
-
-                  boxShadow: isVoted ? `0 0 14px ${votedGlow}` : "none",
-
-                  opacity: poll.expired ? 0.65 : 1,
-                }}
-              >
-                <AnimatedBar
-                  pct={pct}
-                  className={isVoted ? "vote-bar vote-bar-lit" : "vote-bar"}
-                  style={{
-                    position: "absolute",
-                    top: 0,
-                    left: 0,
-                    height: "100%",
-                    background: barBg,
+                      setStaged(i)
+                    }
                   }}
-                />
-                <div
+                  className={live ? "press-pop" : undefined}
                   style={{
                     position: "relative",
 
-                    display: "flex",
+                    width: "100%",
 
-                    justifyContent: "space-between",
+                    padding: compact ? "8px 10px" : "11px 14px",
 
-                    alignItems: "center",
+                    borderRadius: 11,
 
-                    gap: 8,
+                    border: isVoted
+                      ? `2px solid ${barColor}`
+                      : isStaged
+                        ? `2px solid ${barColor}`
+                        : `2px solid var(--border-strong)`,
+
+                    background: "var(--bg)",
+
+                    cursor: clickable ? "pointer" : "default",
+
+                    overflow: "hidden",
+
+                    textAlign: "left",
+
+                    transition: "border-color 0.2s, box-shadow 0.2s",
+
+                    boxShadow: isVoted
+                      ? `0 0 14px ${votedGlow}`
+                      : isStaged
+                        ? `0 0 0 3px color-mix(in srgb, ${barColor} 26%, transparent), 0 0 18px ${votedGlow}`
+                        : "none",
+
+                    opacity: poll.expired ? 0.65 : 1,
                   }}
                 >
-                  <span
+                  {rip && rip.i === i && (
+                    <span
+                      className="ripple"
+                      style={{ left: rip.x, top: rip.y }}
+                    />
+                  )}
+                  <AnimatedBar
+                    pct={pct}
+                    className={
+                      isVoted
+                        ? "vote-bar vote-bar-lit"
+                        : isStaged
+                          ? "vote-stage-glow"
+                          : "vote-bar"
+                    }
                     style={{
-                      fontFamily: "Satoshi, sans-serif",
+                      position: "absolute",
 
-                      fontSize: compact ? 12 : 14,
+                      top: 0,
 
-                      fontWeight: isVoted ? 800 : 600,
+                      left: 0,
 
-                      overflowWrap: "anywhere",
+                      height: "100%",
 
-                      color: isVoted
-                        ? barColor
-                        : didVote
-                          ? "var(--text-faint-3)"
-                          : "var(--text-bright)",
+                      background: isStaged
+                        ? "color-mix(in srgb, var(--primary) 9%, transparent)"
+                        : barBg,
+                    }}
+                  />
+                  <div
+                    style={{
+                      position: "relative",
 
-                      transition: "color 0.2s",
+                      display: "flex",
+
+                      justifyContent: "space-between",
+
+                      alignItems: "center",
+
+                      gap: 8,
                     }}
                   >
-                    {label}
-                  </span>
-                  <span
-                    key={pct}
-                    style={{
-                      fontFamily: "Satoshi, sans-serif",
+                    <span
+                      style={{
+                        fontFamily: "Satoshi, sans-serif",
 
-                      fontSize: compact ? 13 : 15,
+                        fontSize: compact ? 12 : 14,
 
-                      fontWeight: 800,
+                        fontWeight: isVoted ? 800 : isStaged ? 700 : 600,
 
-                      color: barColor,
+                        overflowWrap: "anywhere",
 
-                      opacity: isVoted ? 1 : 0.45,
+                        color: isVoted
+                          ? barColor
+                          : isStaged
+                            ? barColor
+                            : didVote
+                              ? "var(--text-faint-3)"
+                              : "var(--text-bright)",
 
-                      transition: "opacity 0.2s",
-                    }}
-                  >
-                    {pct}%
-                  </span>
-                </div>
-              </button>
-            )
-          })}
+                        transition: "color 0.2s",
+                      }}
+                    >
+                      {label}
+                    </span>
+                    {isStaged ? (
+                      <span
+                        className="stage-hint"
+                        style={{
+                          display: "inline-flex",
+
+                          alignItems: "center",
+
+                          gap: 5,
+
+                          fontFamily: "Satoshi, sans-serif",
+
+                          fontSize: compact ? 10 : 11,
+
+                          fontWeight: 800,
+
+                          color: barColor,
+
+                          whiteSpace: "nowrap",
+
+                          background:
+                            "color-mix(in srgb, var(--primary) 12%, transparent)",
+
+                          borderRadius: 99,
+
+                          padding: "3px 9px",
+                        }}
+                      >
+                        ✓ tap again to lock
+                      </span>
+                    ) : (
+                      <span
+                        key={pct}
+                        style={{
+                          fontFamily: "Satoshi, sans-serif",
+
+                          fontSize: compact ? 13 : 15,
+
+                          fontWeight: 800,
+
+                          color: barColor,
+
+                          opacity: isVoted ? 1 : 0.45,
+
+                          transition: "opacity 0.2s",
+                        }}
+                      >
+                        {pct}%
+                      </span>
+                    )}
+                  </div>
+                </button>
+              )
+            })}
           </div>
         )}
 
@@ -2701,17 +3195,7 @@ function PollCard({
           style={{ color: "var(--text-faint)", fontSize: 12, fontWeight: 700 }}
         >
           {poll.expired ? (
-            <span
-              style={{
-                display: "flex",
-
-                alignItems: "center",
-
-                gap: 4,
-              }}
-            >
-              <FlagIcon size={12} /> Closed · ended
-            </span>
+            <span>Ended {formatPollEnd(poll.createdAt + pollLifetimeMs(poll))}</span>
           ) : (
             <>
               <RollingNumber
@@ -2765,17 +3249,29 @@ function PollCard({
             title="Share this poll"
             style={{
               background: "var(--primary-soft-bg)",
+
               border: "1px solid var(--primary-soft)",
+
               cursor: "pointer",
+
               color: "var(--primary)",
+
               fontSize: 12,
+
               fontWeight: 800,
+
               fontFamily: "Satoshi, sans-serif",
+
               display: "flex",
+
               alignItems: "center",
+
               gap: 5,
+
               padding: isNarrow ? "9px 14px" : "4px 12px",
+
               borderRadius: 99,
+
               transition: "background 0.15s, transform 0.1s",
             }}
             onMouseEnter={(e) =>
@@ -3092,59 +3588,59 @@ function PollCard({
                 marginTop: poll.comments.length ? 8 : 0,
               }}
             >
-            <input
-              value={commentText}
-              onChange={(e) => setCommentText(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleComment()}
-              placeholder="Drop an anonymous take..."
-              maxLength={140}
-              style={{
-                flex: 1,
+              <input
+                value={commentText}
+                onChange={(e) => setCommentText(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleComment()}
+                placeholder="Drop an anonymous take..."
+                maxLength={140}
+                style={{
+                  flex: 1,
 
-                background: "var(--card-bottom)",
+                  background: "var(--card-bottom)",
 
-                border: "1px solid var(--border)",
+                  border: "1px solid var(--border)",
 
-                borderRadius: 9,
+                  borderRadius: 9,
 
-                padding: "8px 12px",
+                  padding: "8px 12px",
 
-                color: "var(--text)",
+                  color: "var(--text)",
 
-                fontSize: isNarrow ? 16 : 13,
+                  fontSize: isNarrow ? 16 : 13,
 
-                fontFamily: "Satoshi, sans-serif",
-              }}
-            />
-            <button
-              onClick={handleComment}
-              disabled={!commentText.trim()}
-              style={{
-                background: commentText.trim()
-                  ? "var(--gradient)"
-                  : "var(--surface-2)",
+                  fontFamily: "Satoshi, sans-serif",
+                }}
+              />
+              <button
+                onClick={handleComment}
+                disabled={!commentText.trim()}
+                style={{
+                  background: commentText.trim()
+                    ? "var(--gradient)"
+                    : "var(--surface-2)",
 
-                border: "none",
+                  border: "none",
 
-                borderRadius: 9,
+                  borderRadius: 9,
 
-                padding: "8px 14px",
+                  padding: "8px 14px",
 
-                color: commentText.trim() ? "#fff" : "var(--text-faint)",
+                  color: commentText.trim() ? "#fff" : "var(--text-faint)",
 
-                fontWeight: 800,
+                  fontWeight: 800,
 
-                fontFamily: "Satoshi, sans-serif",
+                  fontFamily: "Satoshi, sans-serif",
 
-                fontSize: 12,
+                  fontSize: 12,
 
-                cursor: commentText.trim() ? "pointer" : "default",
+                  cursor: commentText.trim() ? "pointer" : "default",
 
-                transition: "all 0.2s",
-              }}
-            >
-              Post
-            </button>
+                  transition: "all 0.2s",
+                }}
+              >
+                Post
+              </button>
             </div>
           )}
         </div>
@@ -3171,8 +3667,11 @@ function SharedPollView({
   onComment: () => void
 }) {
   // Votes and the user's choice are derived from the parent's state (the
+
   // parent guards the vote atomically), so a rapid double-tap can never
+
   // double-count locally and re-renders always reflect the real values.
+
   const votes = poll.options.map((_, i) => poll.votes[i] ?? 0)
 
   const voted = poll.voted
@@ -3188,6 +3687,7 @@ function SharedPollView({
   const meta = categoryMeta(poll.category)
 
   const total = votes.reduce((s, v) => s + v, 0)
+
   const pctOf = (i: number) =>
     total > 0 ? Math.round((votes[i] / total) * 100) : 0
 
@@ -3195,6 +3695,44 @@ function SharedPollView({
     if (voted !== null) return
 
     onVote(i)
+  }
+
+  // Two-tap confirm as on the feed cards: first tap stages, second tap locks.
+  const [staged, setStaged] = useState<number | null>(null)
+
+  const [rip, setRip] = useState<{ i: number; x: number; y: number } | null>(
+    null,
+  )
+
+  const popRipple = (i: number, e: React.MouseEvent<HTMLButtonElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+
+    const hb = { i, x: e.clientX - rect.left, y: e.clientY - rect.top }
+
+    window.setTimeout(
+      () => setRip((prev) => (prev === hb ? null : prev)),
+      650,
+    )
+
+    setRip(hb)
+  }
+
+  const stageOrVote = (i: number, e: React.MouseEvent<HTMLButtonElement>) => {
+    if (voted !== null) return
+
+    popRipple(i, e)
+
+    if (staged === i) {
+      setStaged(null)
+
+      playVoteSound()
+
+      castVote(i)
+    } else {
+      playStageSound()
+
+      setStaged(i)
+    }
   }
 
   return (
@@ -3353,33 +3891,44 @@ function SharedPollView({
                 flexWrap: "wrap",
               }}
             >
-              <span
-                className="tag-pill"
-                style={{
-                  background: meta.bg,
+              {poll.tags.map((t) => {
+                const tm = categoryMeta(t)
 
-                  color: meta.text,
+                const known = resolveCategoryKey(t) in CATEGORY_META
 
-                  padding: "3px 10px",
+                return (
+                  <span
+                    key={t}
+                    className="tag-pill"
+                    style={{
+                      background: tm.bg,
 
-                  borderRadius: 99,
+                      color: tm.text,
 
-                  border: `1px solid ${meta.border}`,
-                }}
-              >
-              <span
-                style={{
-                  display: "inline-flex",
+                      padding: "3px 10px",
 
-                  alignItems: "center",
+                      borderRadius: 99,
 
-                  gap: 5,
-                }}
-              >
-                <CategoryIcon cat={poll.category} size={12} />
-                {poll.category}
-              </span>
-            </span>
+                      border: `1px solid ${tm.border}`,
+                    }}
+                  >
+                    <span
+                      style={{
+                        display: "inline-flex",
+
+                        alignItems: "center",
+
+                        gap: 5,
+                      }}
+                    >
+                      {known && (
+                        <CategoryIcon cat={resolveCategoryKey(t)} size={12} />
+                      )}
+                      {titleCase(t)}
+                    </span>
+                  </span>
+                )
+              })}
               <span
                 style={{
                   display: "inline-flex",
@@ -3476,7 +4025,8 @@ function SharedPollView({
                 return (
                   <button
                     key={i}
-                    onClick={() => castVote(i)}
+                    onClick={(e) => stageOrVote(i, e)}
+                    className={didVote ? undefined : "press-pop"}
                     style={{
                       position: "relative",
 
@@ -3488,7 +4038,9 @@ function SharedPollView({
 
                       border: isVoted
                         ? `2px solid ${barColor}`
-                        : `2px solid var(--border-strong)`,
+                        : !didVote && staged === i
+                          ? `2px solid ${barColor}`
+                          : `2px solid var(--border-strong)`,
 
                       background: "var(--bg)",
 
@@ -3500,17 +4052,45 @@ function SharedPollView({
 
                       transition: "border-color 0.2s, box-shadow 0.2s",
 
-                      boxShadow: isVoted ? `0 0 14px ${votedGlow}` : "none",
+                      boxShadow: isVoted
+                        ? `0 0 14px ${votedGlow}`
+                        : !didVote && staged === i
+                          ? `0 0 0 3px color-mix(in srgb, ${barColor} 26%, transparent), 0 0 18px ${votedGlow}`
+                          : "none",
                     }}
                   >
+                    {rip && rip.i === i && (
+                      <span
+                        className="ripple"
+                        style={{ left: rip.x, top: rip.y }}
+                      />
+                    )}
                     {didVote && (
                       <AnimatedBar
                         pct={pct}
-                        className={isVoted ? "vote-bar vote-bar-lit" : "vote-bar"}
+                        className={
+                          isVoted ? "vote-bar vote-bar-lit" : "vote-bar"
+                        }
                         style={{
                           position: "absolute",
+
                           inset: 0,
+
                           background: barBg,
+                        }}
+                      />
+                    )}
+                    {staged === i && !didVote && (
+                      <AnimatedBar
+                        pct={pct}
+                        className="vote-stage-glow"
+                        style={{
+                          position: "absolute",
+
+                          inset: 0,
+
+                          background:
+                            "color-mix(in srgb, var(--primary) 9%, transparent)",
                         }}
                       />
                     )}
@@ -3533,13 +4113,15 @@ function SharedPollView({
 
                           fontSize: 14,
 
-                          fontWeight: isVoted ? 800 : 600,
+                          fontWeight: isVoted ? 800 : !didVote && staged === i ? 700 : 600,
 
                           color: isVoted
                             ? barColor
-                            : didVote
-                              ? "var(--text-faint-3)"
-                              : "var(--text-bright)",
+                            : !didVote && staged === i
+                              ? barColor
+                              : didVote
+                                ? "var(--text-faint-3)"
+                                : "var(--text-bright)",
 
                           transition: "color 0.2s",
                         }}
@@ -3562,6 +4144,36 @@ function SharedPollView({
                           }}
                         >
                           {pct}%
+                        </span>
+                      ) : !didVote && staged === i ? (
+                        <span
+                          className="stage-hint"
+                          style={{
+                            display: "inline-flex",
+
+                            alignItems: "center",
+
+                            gap: 5,
+
+                            fontFamily: "Satoshi, sans-serif",
+
+                            fontSize: 11,
+
+                            fontWeight: 800,
+
+                            color: barColor,
+
+                            whiteSpace: "nowrap",
+
+                            background:
+                              "color-mix(in srgb, var(--primary) 12%, transparent)",
+
+                            borderRadius: 99,
+
+                            padding: "4px 10px",
+                          }}
+                        >
+                          ✓ tap again to lock
                         </span>
                       ) : (
                         <span
@@ -3659,15 +4271,22 @@ function SharedPollView({
 }
 
 // Static percentage bar: width set directly from the value with no state,
+
 // effects, or transitions, so vote updates can never re-trigger renders or
+
 // animations on the feed.
+
 function AnimatedBar({
   pct,
+
   className,
+
   style,
 }: {
   pct: number
+
   className?: string
+
   style?: CSSProperties
 }) {
   return (
@@ -3675,6 +4294,7 @@ function AnimatedBar({
       className={className}
       style={{
         width: `${Math.max(0, Math.min(100, pct))}%`,
+
         ...style,
       }}
     />
@@ -3682,12 +4302,16 @@ function AnimatedBar({
 }
 
 // Odometer-style count: digits that changed since the last value roll in
+
 // smoothly, unchanged digits stay put.
+
 function RollingNumber({
   value,
+
   style,
 }: {
   value: number
+
   style?: CSSProperties
 }) {
   const prevRef = useRef<number | null>(null)
@@ -3715,6 +4339,7 @@ function RollingNumber({
 
     parts.unshift({
       d: cur[ci],
+
       changed: old === null || oi < 0 || old[oi] !== cur[ci],
     })
   }
@@ -3724,7 +4349,9 @@ function RollingNumber({
       aria-label={str}
       style={{
         display: "inline-flex",
+
         fontVariantNumeric: "tabular-nums",
+
         ...style,
       }}
     >
@@ -3734,10 +4361,7 @@ function RollingNumber({
         return (
           <span key={i} style={{ display: "inline-flex" }}>
             {sep && <span style={{ opacity: 0.55 }}>,</span>}
-            <span
-              key={p.d}
-              className={p.changed ? "digit-roll" : undefined}
-            >
+            <span key={p.d} className={p.changed ? "digit-roll" : undefined}>
               {p.d}
             </span>
           </span>
@@ -3749,25 +4373,43 @@ function RollingNumber({
 
 function ResultRow({
   color,
+
   label,
+
   votes,
+
   pct,
+
   crowned,
+
   showCrown = true,
+
   showBar = false,
+
   active = false,
+
   onHover,
+
   wrap = false,
 }: {
   color: string
+
   label: string
+
   votes: number
+
   pct: number
+
   crowned: boolean
+
   showCrown?: boolean
+
   showBar?: boolean
+
   active?: boolean
+
   onHover?: (h: boolean) => void
+
   wrap?: boolean
 }) {
   return (
@@ -3776,49 +4418,70 @@ function ResultRow({
       onMouseLeave={() => onHover?.(false)}
       style={{
         display: "flex",
+
         flexDirection: "column",
+
         gap: 5,
+
         padding: "7px 10px",
+
         borderRadius: 10,
+
         background: active
           ? "var(--surface-2)"
           : crowned
             ? "var(--primary-soft-bg)"
             : "var(--surface)",
+
         border: active
           ? `1px solid ${color}`
           : crowned
             ? "1px solid var(--primary-soft)"
             : "1px solid var(--border)",
+
         cursor: "default",
       }}
     >
       <div
         style={{
           display: "flex",
+
           alignItems: "center",
+
           gap: 8,
         }}
       >
         <span
           style={{
             width: 9,
+
             height: 9,
+
             borderRadius: "50%",
+
             background: color,
+
             flexShrink: 0,
           }}
         />
         <span
           style={{
             flex: 1,
+
             minWidth: 0,
+
             overflow: wrap ? "visible" : "hidden",
+
             textOverflow: wrap ? "clip" : "ellipsis",
+
             whiteSpace: wrap ? "normal" : "nowrap",
+
             lineHeight: wrap ? 1.35 : undefined,
+
             color: "var(--text-muted)",
+
             fontSize: 12,
+
             fontWeight: 700,
           }}
         >
@@ -3827,8 +4490,11 @@ function ResultRow({
         <span
           style={{
             color: "var(--text)",
+
             fontSize: 12,
+
             fontWeight: 900,
+
             fontVariantNumeric: "tabular-nums",
           }}
         >
@@ -3837,10 +4503,15 @@ function ResultRow({
         <span
           style={{
             color: color,
+
             fontSize: 12,
+
             fontWeight: 900,
+
             minWidth: 44,
+
             textAlign: "right",
+
             fontVariantNumeric: "tabular-nums",
           }}
         >
@@ -3852,17 +4523,24 @@ function ResultRow({
         <div
           style={{
             height: 4,
+
             borderRadius: 99,
+
             background: "var(--surface-2)",
+
             overflow: "hidden",
           }}
         >
           <div
             style={{
               height: "100%",
+
               width: `${pct}%`,
+
               borderRadius: 99,
+
               background: color,
+
               opacity: 0.85,
             }}
           />
@@ -3907,7 +4585,10 @@ function PollResults({
 
     .filter((i) => i >= 0)
 
-  const centerTotal = useMemo(() => hovered !== null ? (poll.votes[hovered] ?? 0) : total, [hovered, poll.votes, total])
+  const centerTotal = useMemo(
+    () => (hovered !== null ? (poll.votes[hovered] ?? 0) : total),
+    [hovered, poll.votes, total],
+  )
 
   const R = 40
 
@@ -4058,18 +4739,13 @@ function PollResults({
                 r={R}
                 fill="none"
                 stroke={s.color}
-                strokeWidth={
-                  hovered === s.i ? strokeW + 4 : strokeW
-                }
+                strokeWidth={hovered === s.i ? strokeW + 4 : strokeW}
                 strokeDasharray={`${mounted ? s.len : 0} ${C}`}
                 strokeDashoffset={-s.offset}
-                opacity={
-                  hovered === null || hovered === s.i ? 1 : 0.28
-                }
+                opacity={hovered === null || hovered === s.i ? 1 : 0.28}
                 style={{
-                  transitionDelay: `${
-                    hovered === null ? s.i * 0.12 : 0
-                  }s`,
+                  transitionDelay: `${hovered === null ? s.i * 0.12 : 0}s`,
+
                   cursor: "pointer",
                 }}
                 onMouseEnter={() => setHovered(s.i)}
@@ -4122,14 +4798,24 @@ function PollResults({
               <span
                 style={{
                   fontSize: 10,
+
                   fontWeight: 800,
-                  color: hovered !== null ? "var(--primary)" : "var(--text-faint)",
+
+                  color:
+                    hovered !== null ? "var(--primary)" : "var(--text-faint)",
+
                   letterSpacing: "0.06em",
+
                   textTransform: "uppercase",
+
                   maxWidth: donutSize - 24,
+
                   overflow: "hidden",
+
                   textOverflow: "ellipsis",
+
                   whiteSpace: "nowrap",
+
                   transition: "color 0.2s",
                 }}
               >
@@ -4202,7 +4888,7 @@ function WelcomeModal({ onClose }: { onClose: () => void }) {
 
       title: "What to expect",
 
-      body: "Polls close automatically after 6–48 hours (the poll creator picks the limit) and are archived. Vote, comment, upvote, and share any poll.",
+      body: "Polls close automatically after 6–48 hours (the poll creator picks the limit) — results land in the Results tab. Vote, comment, upvote, and share any poll.",
     },
 
     {
@@ -4357,6 +5043,298 @@ function WelcomeModal({ onClose }: { onClose: () => void }) {
   )
 }
 
+/* Compact header pill that opens the theme gallery */
+function ThemeSwatchButton({
+  theme,
+
+  compact = false,
+
+  onOpen,
+}: {
+  theme: string
+
+  compact?: boolean
+
+  onOpen: () => void
+}) {
+  const swatch = THEMES.find((t) => t.id === theme)?.swatch ?? THEMES[0].swatch
+
+  return (
+    <button
+      onClick={onOpen}
+      title="Color theme"
+      aria-label="Color theme"
+      style={{
+        display: "flex",
+
+        alignItems: "center",
+
+        gap: 5,
+
+        background: "var(--surface)",
+
+        border: "1px solid var(--border)",
+
+        borderRadius: 9,
+
+        height: 36,
+
+        padding: compact ? "0 10px" : "0 12px",
+
+        lineHeight: 1,
+
+        color: "var(--text-dim)",
+
+        fontFamily: "Satoshi, sans-serif",
+
+        fontWeight: 800,
+
+        fontSize: 12,
+
+        cursor: "pointer",
+
+        transition: "all 0.15s",
+      }}
+    >
+      <span style={{ display: "inline-flex", gap: 2 }}>
+        {swatch.map((c, i) => (
+          <span
+            key={i}
+            style={{
+              width: 7,
+
+              height: 7,
+
+              borderRadius: "50%",
+
+              background: c,
+
+              display: "inline-block",
+            }}
+          />
+        ))}
+      </span>
+      {!compact && <span style={{ whiteSpace: "nowrap" }}>Theme</span>}
+    </button>
+  )
+}
+
+/* Theme gallery modal: pick from all the island colors at once */
+function ThemeModal({
+  theme,
+
+  onTheme,
+
+  onClose,
+}: {
+  theme: string
+
+  onTheme: (t: string) => void
+
+  onClose: () => void
+}) {
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={onClose}
+      style={{
+        position: "fixed",
+
+        inset: 0,
+
+        background: "rgba(5,3,15,0.88)",
+
+        backdropFilter: "blur(10px)",
+
+        display: "flex",
+
+        alignItems: "center",
+
+        justifyContent: "center",
+
+        zIndex: 100,
+
+        padding: 16,
+      }}
+    >
+      <div
+        className="modal-panel"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background:
+            "linear-gradient(160deg, var(--surface-2), var(--card-bottom))",
+
+          border: "1px solid var(--border)",
+
+          borderRadius: 24,
+
+          padding: 24,
+
+          width: "100%",
+
+          maxWidth: 420,
+
+          maxHeight: "min(85vh, 700px)",
+
+          overflowY: "auto",
+        }}
+      >
+        <h2
+          style={{
+            fontFamily: "Satoshi, sans-serif",
+
+            fontSize: 22,
+
+            fontWeight: 900,
+
+            margin: "0 0 2px",
+
+            color: "var(--text)",
+          }}
+        >
+          Theme
+        </h2>
+        <p
+          style={{
+            fontSize: 13,
+
+            fontWeight: 600,
+
+            color: "var(--text-faint)",
+
+            margin: "0 0 18px",
+          }}
+        >
+          Pick the island colors. Changes take effect instantly.
+        </p>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {THEMES.map((t) => {
+            const active = theme === t.id
+
+            return (
+              <button
+                key={t.id}
+                onClick={() => onTheme(t.id)}
+                style={{
+                  display: "flex",
+
+                  alignItems: "center",
+
+                  gap: 12,
+
+                  width: "100%",
+
+                  background: active
+                    ? "var(--primary-soft-bg)"
+                    : "var(--bg)",
+
+                  border: active
+                    ? "1px solid var(--primary-soft)"
+                    : "1px solid var(--border)",
+
+                  borderRadius: 12,
+
+                  padding: "12px 14px",
+
+                  cursor: "pointer",
+
+                  transition: "all 0.15s",
+                }}
+              >
+                <span
+                  style={{
+                    display: "inline-flex",
+
+                    gap: 3,
+
+                    flexShrink: 0,
+                  }}
+                >
+                  {t.swatch.map((c, i) => (
+                    <span
+                      key={i}
+                      style={{
+                        width: 10,
+
+                        height: 10,
+
+                        borderRadius: "50%",
+
+                        background: c,
+
+                        display: "inline-block",
+                      }}
+                    />
+                  ))}
+                </span>
+                <span
+                  style={{
+                    fontFamily: "Satoshi, sans-serif",
+
+                    fontSize: 15,
+
+                    fontWeight: 800,
+
+                    color: "var(--text)",
+                  }}
+                >
+                  {t.name}
+                </span>
+                <span
+                  style={{
+                    marginLeft: "auto",
+
+                    fontFamily: "Satoshi, sans-serif",
+
+                    fontSize: 10.5,
+
+                    fontWeight: 800,
+
+                    color: active ? "var(--primary)" : "var(--text-faint)",
+                  }}
+                >
+                  {active ? "✓ Active" : "Apply"}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+
+        <button
+          onClick={onClose}
+          style={{
+            width: "100%",
+
+            marginTop: 18,
+
+            background: "var(--gradient)",
+
+            border: "none",
+
+            borderRadius: 12,
+
+            padding: "12px 0",
+
+            color: "#fff",
+
+            fontFamily: "Satoshi, sans-serif",
+
+            fontWeight: 900,
+
+            fontSize: 14,
+
+            cursor: "pointer",
+          }}
+        >
+          Done
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function RulesModal({ onClose }: { onClose: () => void }) {
   const rules = [
     "Be kind — no hate, harassment, or personal attacks.",
@@ -4369,11 +5347,11 @@ function RulesModal({ onClose }: { onClose: () => void }) {
 
     "🔒 Privacy: votes are anonymous and your choices stay private to you — nobody can see how you voted.",
 
-    "🗳️ One vote per poll, forever — vote carefully, you can't change it.",
+    "🗳️ Your vote only locks when you tap an option twice — tap an option, then tap it again to confirm. After that it's final.",
 
     "Admin can remove polls that break these rules.",
 
-    "⏰ Polls close 6–48 hours after being posted (you choose the limit) — closed polls are archived.",
+    "⏰ Polls close 6–48 hours after being posted (you choose the limit) — closed polls land in Results.",
   ]
 
   return (
@@ -4545,23 +5523,51 @@ function NewPollModal({
 
   const [options, setOptions] = useState<string[]>(["", ""])
 
-  const [category, setCategory] = useState<string>("Community")
+  const [tags, setTags] = useState<string[]>([])
 
-  const [customOpen, setCustomOpen] = useState(false)
+  const [tagInput, setTagInput] = useState("")
 
   const [durationH, setDurationH] = useState(24)
 
   const filledOptions = options.map((o) => o.trim()).filter((o) => o !== "")
 
-  const hasDuplicates = new Set(filledOptions.map((o) => o.toLowerCase())).size !==
+  const hasDuplicates =
+    new Set(filledOptions.map((o) => o.toLowerCase())).size !==
     filledOptions.length
+
+  const addTag = (raw: string) => {
+    const t = sanitizeTag(raw)
+
+    // Pure symbols/emoji/whitespace sanitize to nothing — clear the input so
+
+    // the box doesn't get stuck on a tag that can never be added.
+
+    if (!t) {
+      setTagInput("")
+
+      return
+    }
+
+    if (t.length > TAG_MAX_LEN) return
+
+    setTags((prev) =>
+      prev.length >= MAX_TAGS || prev.some((x) => x === t)
+        ? prev
+        : [...prev, t],
+    )
+
+    setTagInput("")
+  }
+
+  const removeTag = (t: string) =>
+    setTags((prev) => prev.filter((x) => x !== t))
 
   const valid =
     question.trim() !== "" &&
     author.trim() !== "" &&
     filledOptions.length >= MIN_OPTIONS &&
     !hasDuplicates &&
-    (!customOpen || category.trim() !== "")
+    tags.length > 0
 
   const updateOption = (i: number, value: string) =>
     setOptions((prev) => prev.map((o, idx) => (idx === i ? value : o)))
@@ -4602,7 +5608,7 @@ function NewPollModal({
       }}
     >
       <div
-        className="modal-panel"
+        className="modal-panel create-poll-glow"
         onMouseDown={(e) => e.stopPropagation()}
         onClick={(e) => e.stopPropagation()}
         style={{
@@ -4648,10 +5654,10 @@ function NewPollModal({
           }}
         >
           <SproutIcon size={19} />
-          Start a Poll
+          Poll eh Fashaa
         </h2>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: 13 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 17 }}>
           <div>
             <label
               style={{
@@ -4667,17 +5673,17 @@ function NewPollModal({
 
                 display: "block",
 
-                marginBottom: 5,
+                marginBottom: 7,
               }}
             >
               Your name
             </label>
-            <div style={{ display: "flex", gap: 7 }}>
+            <div style={{ display: "flex", gap: 8 }}>
               <input
                 value={author}
                 onChange={(e) => setAuthor(e.target.value)}
                 placeholder="Pick a name..."
-                maxLength={30}
+                maxLength={20}
                 style={{
                   flex: 1,
 
@@ -4727,7 +5733,7 @@ function NewPollModal({
             </div>
           </div>
 
-          <div>
+          <div style={{ position: "relative" }}>
             <label
               style={{
                 fontSize: 11,
@@ -4742,17 +5748,20 @@ function NewPollModal({
 
                 display: "block",
 
-                marginBottom: 5,
+                marginBottom: 7,
               }}
             >
               Question
             </label>
             <textarea
+              id="new-poll-question"
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               placeholder="Ask the island something..."
               maxLength={120}
               rows={2}
+              aria-label="Poll question"
+              aria-describedby="new-poll-question-count"
               style={{
                 width: "100%",
 
@@ -4762,7 +5771,7 @@ function NewPollModal({
 
                 borderRadius: 11,
 
-                padding: "10px 13px",
+                padding: "10px 13px 32px",
 
                 color: "var(--text)",
 
@@ -4773,9 +5782,15 @@ function NewPollModal({
                 resize: "none",
               }}
             />
+            <CharCounter
+              id="new-poll-question-count"
+              length={question.length}
+              max={120}
+              float
+            />
           </div>
 
-          <div>
+          <div style={{ position: "relative" }}>
             <label
               style={{
                 fontSize: 11,
@@ -4790,7 +5805,7 @@ function NewPollModal({
 
                 display: "block",
 
-                marginBottom: 5,
+                marginBottom: 7,
               }}
             >
               Description{" "}
@@ -4807,11 +5822,14 @@ function NewPollModal({
               </span>
             </label>
             <textarea
+              id="new-poll-description"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Add a bit of context..."
-              maxLength={280}
+              maxLength={350}
               rows={2}
+              aria-label="Poll description"
+              aria-describedby="new-poll-description-count"
               style={{
                 width: "100%",
 
@@ -4821,7 +5839,7 @@ function NewPollModal({
 
                 borderRadius: 11,
 
-                padding: "10px 13px",
+                padding: "10px 13px 32px",
 
                 color: "var(--text)",
 
@@ -4832,6 +5850,12 @@ function NewPollModal({
                 resize: "none",
               }}
             />
+            <CharCounter
+              id="new-poll-description-count"
+              length={description.length}
+              max={350}
+              float
+            />
           </div>
 
           <div
@@ -4841,7 +5865,7 @@ function NewPollModal({
               gridTemplateColumns:
                 options.length === MIN_OPTIONS ? "1fr 1fr" : "1fr",
 
-              gap: 9,
+              gap: 12,
             }}
           >
             {options.map((opt, i) => {
@@ -5007,39 +6031,140 @@ function NewPollModal({
                 marginBottom: 7,
               }}
             >
-              Category
-            </label>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
-              {(Object.keys(CATEGORY_META) as Category[]).map((cat) => {
-                const m = categoryMeta(cat)
+              Tags{" "}
+              <span
+                style={{
+                  color: "var(--text-faint)",
 
-                const active = !customOpen && category === cat
+                  fontWeight: 600,
+
+                  textTransform: "none",
+                }}
+              >
+                ({tags.length}/{MAX_TAGS} — press Enter)
+              </span>
+            </label>
+            {tags.length > 0 && (
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 5,
+                  marginBottom: 8,
+                }}
+              >
+                {tags.map((t) => {
+                  const m = categoryMeta(t)
+
+                  return (
+                    <button
+                      key={t}
+                      onClick={() => removeTag(t)}
+                      title="Remove tag"
+                      className="tag-pill"
+                      style={{
+                        background: m.bg,
+
+                        color: m.text,
+
+                        padding: "4px 11px",
+
+                        borderRadius: 99,
+
+                        border: `1px solid ${m.border}`,
+
+                        cursor: "pointer",
+
+                        transition: "all 0.15s",
+                      }}
+                    >
+                      {titleCase(t)} ×
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+            <input
+              value={tagInput}
+              onChange={(e) =>
+                setTagInput(e.target.value.replace(/\s+/g, ""))
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault()
+
+                  addTag(tagInput)
+                }
+
+                if (
+                  e.key === "Backspace" &&
+                  tagInput === "" &&
+                  tags.length > 0
+                ) {
+                  removeTag(tags[tags.length - 1])
+                }
+              }}
+              disabled={tags.length >= MAX_TAGS}
+              placeholder={
+                tags.length >= MAX_TAGS
+                  ? "Tag limit reached"
+                  : "Add a tag… (e.g. gaming, memeology)"
+              }
+              maxLength={TAG_MAX_LEN}
+              style={{
+                width: "100%",
+
+                background: "var(--bg)",
+
+                border: "1px solid var(--border)",
+
+                borderRadius: 9,
+
+                padding: "8px 11px",
+
+                color: "var(--text)",
+
+                fontSize: isNarrow ? 16 : 13,
+
+                fontFamily: "Satoshi, sans-serif",
+              }}
+            />
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 5,
+                marginTop: 8,
+              }}
+            >
+              {(Object.keys(CATEGORY_META) as Category[]).map((cat) => {
+                const used =
+                  tags.includes(normalizeTag(cat)) || tags.length >= MAX_TAGS
 
                 return (
                   <button
                     key={cat}
-                    onClick={() => {
-                      setCustomOpen(false)
-
-                      setCategory(cat)
-                    }}
+                    onClick={() => addTag(cat)}
+                    disabled={used}
                     className="tag-pill"
                     style={{
-                      background: active ? m.bg : "transparent",
+                      background: "transparent",
 
-                      color: active ? m.text : "var(--text-faint)",
+                      color: used ? "var(--text-faint)" : "var(--text-faint)",
 
                       padding: "4px 11px",
 
                       borderRadius: 99,
 
-                      border: active
-                        ? `1px solid ${m.border}`
+                      border: used
+                        ? "1px dashed var(--border-strong)"
                         : "1px solid var(--border)",
 
-                      cursor: "pointer",
+                      cursor: used ? "default" : "pointer",
 
                       transition: "all 0.15s",
+
+                      opacity: used ? 0.45 : 1,
                     }}
                   >
                     <span
@@ -5057,64 +6182,7 @@ function NewPollModal({
                   </button>
                 )
               })}
-              <button
-                onClick={() => {
-                  setCategory("")
-
-                  setCustomOpen(true)
-                }}
-                className="tag-pill"
-                style={{
-                  background: customOpen
-                    ? "var(--primary-soft-bg)"
-                    : "transparent",
-
-                  color: customOpen ? "var(--primary)" : "var(--text-faint)",
-
-                  padding: "4px 11px",
-
-                  borderRadius: 99,
-
-                  border: customOpen
-                    ? "1px solid var(--primary-soft)"
-                    : "1px dashed var(--border-strong)",
-
-                  cursor: "pointer",
-
-                  transition: "all 0.15s",
-                }}
-              >
-                ✏️ Custom
-              </button>
             </div>
-            {customOpen && (
-              <input
-                value={category}
-                onChange={(e) => setCategory(e.target.value)}
-                placeholder="Type your own category…"
-                maxLength={20}
-                autoFocus
-                style={{
-                  marginTop: 8,
-
-                  width: "100%",
-
-                  background: "var(--bg)",
-
-                  border: "1px solid var(--border)",
-
-                  borderRadius: 9,
-
-                  padding: "8px 11px",
-
-                  color: "var(--text)",
-
-                  fontSize: isNarrow ? 16 : 13,
-
-                  fontFamily: "Satoshi, sans-serif",
-                }}
-              />
-            )}
           </div>
 
           <div>
@@ -5234,7 +6302,9 @@ function NewPollModal({
 
                     options: filledOptions,
 
-                    category,
+                    tags,
+
+                    category: deriveCategory(tags),
 
                     durationH,
                   })
@@ -5302,7 +6372,9 @@ export default function App() {
   const [archiveRawPolls, setArchiveRawPolls] = useState<RawPoll[]>([])
 
   // Paginated tail: docs older than the live snapshot window, fetched on
+
   // demand. Never replaced by snapshots — only merged, deduped by id.
+
   const [olderPolls, setOlderPolls] = useState<RawPoll[]>([])
 
   const [olderArchivePolls, setOlderArchivePolls] = useState<RawPoll[]>([])
@@ -5339,6 +6411,8 @@ export default function App() {
 
   const [showRules, setShowRules] = useState(false)
 
+  const [showTheme, setShowTheme] = useState(false)
+
   const [openCommentsId, setOpenCommentsId] = useState<string | null>(null)
 
   const [showMine, setShowMine] = useState(false)
@@ -5364,6 +6438,10 @@ export default function App() {
       description: data.description,
 
       category: data.category ? data.category : "General",
+
+      tags: data.tags?.length
+        ? data.tags.map(sanitizeTag).filter(Boolean).slice(0, MAX_TAGS)
+        : deriveTags(data),
 
       author: data.author ?? "Anonymous",
 
@@ -5395,6 +6473,8 @@ export default function App() {
 
   const [filterOpen, setFilterOpen] = useState(false)
 
+  const [mobileTagsOpen, setMobileTagsOpen] = useState(false)
+
   const [search, setSearch] = useState("")
 
   const [searchPh, setSearchPh] = useState("Ask the island something…")
@@ -5416,14 +6496,14 @@ export default function App() {
     "newest",
   )
 
-  const [view, setView] = useState<"list" | "grid">(
-    () => (window.innerWidth < 640 ? "list" : "grid"),
-  )
+  const [view, setView] = useState<"list" | "grid">("list")
+
+  const [viewTouched, setViewTouched] = useState(false)
 
   const [liveCount, setLiveCount] = useState(1)
 
   const [theme, setTheme] = useState(
-    () => localStorage.getItem("bageecha-theme") || "ocean",
+    () => localStorage.getItem("bageecha-theme") || "graphite",
   )
 
   const [ctaIndex, setCtaIndex] = useState(() =>
@@ -5467,7 +6547,9 @@ export default function App() {
   const bootedRef = useRef(false)
 
   // Pagination cursors and guards (authoritative flags live in refs so
+
   // snapshot callbacks and async loads never read stale state).
+
   const feedCursorRef = useRef<QueryDocumentSnapshot | null>(null)
 
   const feedHasMoreRef = useRef(false)
@@ -5495,8 +6577,11 @@ export default function App() {
   const toastTimer = useRef(0)
 
   // In-flight action guards: state updates are async, so two rapid clicks
+
   // (or Enter presses) within the same frame would otherwise double-apply
+
   // votes/likes/comments against stale closure state.
+
   const votePendingRef = useRef<Set<string>>(new Set())
 
   const redditVotePendingRef = useRef<Set<string>>(new Set())
@@ -5546,28 +6631,45 @@ export default function App() {
   )
 
   const filters = useMemo(() => {
-    const custom = new Set<string>()
+    // Rank tags by how many polls use them so junk/one-off tags can't crowd
 
-    for (const p of polls) {
-      if (!(p.category in CATEGORY_META)) custom.add(p.category)
+    // the rail; only the most-used ones are offered as filter pills.
+
+    const counts = new Map<string, number>()
+
+    for (const p of [...polls, ...archivePolls]) {
+      for (const t of p.tags) {
+        if (!t) continue
+
+        counts.set(t, (counts.get(t) ?? 0) + 1)
+      }
     }
 
-    const extra: FilterOption[] = [...custom].map((c) => ({
-      label: c,
+    const list = [...counts.entries()]
 
-      value: c,
-    }))
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
 
-    return [...ALL_FILTERS, ...extra]
-  }, [polls])
+      .slice(0, 12)
+
+      .map(([t]) => t)
+
+    return [
+      { label: "All", value: "all" },
+
+      ...list.map((t) => ({ label: titleCase(t), value: t })),
+    ] as FilterOption[]
+  }, [polls, archivePolls])
 
   const patchRaw = (id: string, fn: (p: RawPoll) => RawPoll) => {
     const patch = (prev: RawPoll[]) =>
       prev.map((p) => (p.id === id ? fn(p) : p))
 
     // Patch every list a poll can render from (live window, paginated
+
     // tails, archive) so optimistic updates show instantly everywhere
+
     // and stay consistent when the poll shifts between lists.
+
     setRawPolls(patch)
 
     setOlderPolls(patch)
@@ -5656,10 +6758,40 @@ export default function App() {
 
     const close = () => setFilterOpen(false)
 
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close()
+    }
+
     window.addEventListener("click", close)
 
-    return () => window.removeEventListener("click", close)
+    window.addEventListener("keydown", onKey)
+
+    return () => {
+      window.removeEventListener("click", close)
+
+      window.removeEventListener("keydown", onKey)
+    }
   }, [filterOpen])
+
+  useEffect(() => {
+    if (!mobileTagsOpen) return
+
+    const close = () => setMobileTagsOpen(false)
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close()
+    }
+
+    window.addEventListener("click", close)
+
+    window.addEventListener("keydown", onKey)
+
+    return () => {
+      window.removeEventListener("click", close)
+
+      window.removeEventListener("keydown", onKey)
+    }
+  }, [mobileTagsOpen])
 
   useEffect(() => {
     try {
@@ -5712,10 +6844,15 @@ export default function App() {
 
         if (docs.length > 0) {
           // Only touch state when the snapshot data actually changed:
+
           // Firestore re-fires on metadata-only events (local writes,
+
           // connectivity) with identical data, and replacing the whole
+
           // polls array with fresh references on every event re-renders
+
           // every card and re-runs sorting endlessly.
+
           const key = docs.map((d) => JSON.stringify(d)).join("|")
 
           if (key !== feedSnapKeyRef.current) {
@@ -5724,12 +6861,16 @@ export default function App() {
             setRawPolls(docs)
 
             // A doc that left the live window was either pushed out by new
+
             // arrivals (still exists — keep it visible) or deleted (drop it).
+
             absorbWindowShift(feedPrevWindowRef, docs, setOlderPolls)
           }
 
           // First real data: anchor the pagination cursor to the window's
+
           // oldest doc and advertise more pages if the window is full.
+
           if (!feedLoadedRef.current) {
             feedLoadedRef.current = true
 
@@ -5837,14 +6978,19 @@ export default function App() {
   }, [])
 
   // Recent polls for the archive view — everyone can see closed polls. The
+
   // live window is the newest 50; older pages load on demand via cursor
+
   // pagination (a where+orderBy composite index isn't available, so
+
   // expired-but-archived polls are filtered client-side by `p.expired`).
 
   useEffect(() => {
     const q = query(
       collection(db, "polls"),
+
       orderBy("createdAt", "desc"),
+
       limit(50),
     )
 
@@ -5884,10 +7030,15 @@ export default function App() {
   }, [])
 
   // Auto-archive: polls past their lifetime leave the feed and become
+
   // available in the archive. Runs on mount, whenever a poll list changes,
+
   // and on a minute timer (a poll can expire mid-session with no new
+
   // snapshot event to trigger the check); the write is idempotent. Both the
+
   // feed window and the archive window are scanned so polls ranked 51–60
+
   // (present only in the feed) still get archived.
 
   const runAutoArchive = () => {
@@ -5903,7 +7054,9 @@ export default function App() {
 
     const batch = writeBatch(db)
 
-    toArchive.forEach((d) => batch.update(doc(db, "polls", d.id), { archived: true }))
+    toArchive.forEach((d) =>
+      batch.update(doc(db, "polls", d.id), { archived: true }),
+    )
 
     batch.commit().catch((err) => console.error("Auto-archive failed", err))
   }
@@ -5957,26 +7110,52 @@ export default function App() {
 
   // Lock page scroll while a modal/overlay is open so wheel and touch input
 
-  // stay inside the dialog instead of scrolling the feed behind it.
+  // stay inside the dialog instead of scrolling the feed behind it. Also
+
+  // close the topmost dialog on Escape and hand focus back to whatever the
+
+  // user was interacting with before the overlay opened.
 
   useEffect(() => {
     const overlayOpen =
       showModal ||
       showRules ||
+      showTheme ||
       welcomeOpen ||
       confirmDelete !== null ||
       adminDeniedName !== null
 
     if (!overlayOpen) return
 
-    const prev = document.body.style.overflow
+    const prevOverflow = document.body.style.overflow
+
+    const prevFocus = document.activeElement as HTMLElement | null
 
     document.body.style.overflow = "hidden"
 
-    return () => {
-      document.body.style.overflow = prev
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return
+
+      e.preventDefault()
+
+      if (adminDeniedName) setAdminDeniedName(null)
+      else if (confirmDelete) setConfirmDelete(null)
+      else if (showTheme) setShowTheme(false)
+      else if (showRules) setShowRules(false)
+      else if (showModal) setShowModal(false)
+      else if (welcomeOpen) setWelcomeOpen(false)
     }
-  }, [showModal, showRules, welcomeOpen, confirmDelete, adminDeniedName])
+
+    window.addEventListener("keydown", onKey)
+
+    return () => {
+      document.body.style.overflow = prevOverflow
+
+      window.removeEventListener("keydown", onKey)
+
+      prevFocus?.focus?.()
+    }
+  }, [showModal, showRules, showTheme, welcomeOpen, confirmDelete, adminDeniedName])
 
   // Scroll-driven collapse of the header + filter bar. Starts animating only
 
@@ -5996,21 +7175,30 @@ export default function App() {
   }, [])
 
   // Sync the collapsed state on mount and on layout changes so a reload at a
+
   // scrolled position starts already hidden instead of animating from the top.
+
   useLayoutEffect(() => {
     // Functional update: if the value is unchanged React bails out, so this
+
     // effect can never contribute to a render loop.
+
     setChromeHidden((prev) =>
-      prev === (window.scrollY > 24) ? prev : window.scrollY > 24,
+      prev === window.scrollY > 24 ? prev : window.scrollY > 24,
     )
   }, [view, isNarrow])
 
   useEffect(() => {
     let disposed = false
+
     let source: EventSource | null = null
+
     let attempts = 0
+
     let fallbackTimer: number | undefined
+
     let connectTimer: number | undefined
+
     let firstCountTimer: number | undefined
 
     const startFallback = () => {
@@ -6028,13 +7216,18 @@ export default function App() {
 
       source = new EventSource(`${import.meta.env.BASE_URL}api/online`)
 
-      firstCountTimer = window.setTimeout(() => {
-        // No count arrived in time: this origin has no SSE endpoint
-        // (e.g. static hosting), so fall back to the jitter counter.
-        source?.close()
+      firstCountTimer = window.setTimeout(
+        () => {
+          // No count arrived in time: this origin has no SSE endpoint
 
-        startFallback()
-      }, 5000)
+          // (e.g. static hosting), so fall back to the jitter counter.
+
+          source?.close()
+
+          startFallback()
+        },
+        5000,
+      )
 
       source.addEventListener("message", (ev) => {
         try {
@@ -6095,8 +7288,6 @@ export default function App() {
 
     votePendingRef.current.add(id)
 
-    playVoteSound()
-
     setProfile((prev) => ({ ...prev, [id]: { ...prev[id], voted: option } }))
 
     const current = allRawPolls.find((p) => p.id === id)
@@ -6125,15 +7316,19 @@ export default function App() {
       tx.update(ref, { votes: cur })
     }).then(
       () => votePendingRef.current.delete(id),
+
       (err) => {
         console.error("Vote write failed", err)
 
         votePendingRef.current.delete(id)
 
         // Roll back the optimistic vote so the UI never shows a count
+
         // that doesn't exist on the server.
+
         setProfile((prev) => ({
           ...prev,
+
           [id]: { ...prev[id], voted: null },
         }))
 
@@ -6184,13 +7379,16 @@ export default function App() {
     }))
 
     updateDoc(doc(db, "polls", pollId), { [`comments.${cid}`]: comment })
+
       .then(() => commentPendingRef.current.delete(pollId))
+
       .catch((err) => {
         console.error("Comment write failed", err)
 
         commentPendingRef.current.delete(pollId)
 
         // Roll back the optimistic comment so it doesn't linger forever.
+
         patchRaw(pollId, (p) => {
           const comments = { ...p.comments }
 
@@ -6257,13 +7455,16 @@ export default function App() {
     updateDoc(doc(db, "polls", pollId), {
       [`comments.${commentId}.replies.${rid}`]: reply,
     })
+
       .then(() => replyPendingRef.current.delete(replyKey))
+
       .catch((err) => {
         console.error("Reply write failed", err)
 
         replyPendingRef.current.delete(replyKey)
 
         // Roll back the optimistic reply so it doesn't linger forever.
+
         patchRaw(pollId, (p) => {
           const comments = { ...p.comments }
 
@@ -6331,6 +7532,7 @@ export default function App() {
         : arrayUnion(anonId),
     }).then(
       () => likePendingRef.current.delete(likeKey),
+
       (err) => {
         console.error("Comment like write failed", err)
 
@@ -6390,14 +7592,17 @@ export default function App() {
     if (Object.keys(update).length > 0)
       updateDoc(doc(db, "polls", id), update).then(
         () => redditVotePendingRef.current.delete(id),
+
         (err) => {
           console.error("Reddit vote write failed", err)
 
           redditVotePendingRef.current.delete(id)
 
           // Roll back the optimistic up/down vote.
+
           setProfile((prev) => ({
             ...prev,
+
             [id]: { ...prev[id], userVote: current },
           }))
 
@@ -6458,8 +7663,6 @@ export default function App() {
   }
 
   const handleSharedVote = (option: number) => {
-    playVoteSound()
-
     setSharedPoll((prev) => {
       if (!prev || prev.voted !== null) return prev
 
@@ -6507,6 +7710,7 @@ export default function App() {
         console.error("Shared poll save failed", err)
 
         // Roll back the optimistic insert so no phantom poll lingers.
+
         setRawPolls((prev) => prev.filter((p) => p.id !== targetId))
 
         showToast("Couldn't save the poll — try again", 3500)
@@ -6518,14 +7722,20 @@ export default function App() {
     exitShared()
 
     // Open the comment box only after exiting the shared view, otherwise
+
     // exitShared's own clear would close it again in the same render.
+
     setOpenCommentsId(targetId)
   }
 
   // Cursor-based pagination: fetch the next page of older polls (by
+
   // createdAt desc — the only server-ordered axis; active sort modes are
+
   // applied client-side over the merged set). Feed is capped at 10 pages
+
   // (~600 polls) per session; the archive loads until exhausted.
+
   const loadMoreFeed = async () => {
     if (loadingMore || !feedHasMoreRef.current || !feedCursorRef.current) return
 
@@ -6577,7 +7787,11 @@ export default function App() {
   }
 
   const loadMoreArchive = async () => {
-    if (archiveLoadingMore || !archiveHasMoreRef.current || !archiveCursorRef.current)
+    if (
+      archiveLoadingMore ||
+      !archiveHasMoreRef.current ||
+      !archiveCursorRef.current
+    )
       return
 
     setArchiveLoadingMore(true)
@@ -6641,6 +7855,17 @@ export default function App() {
     const newPoll: Poll = {
       ...data,
 
+      tags:
+        Array.isArray(data.tags) && data.tags.length > 0
+          ? data.tags
+
+              .map(sanitizeTag)
+
+              .filter(Boolean)
+
+              .slice(0, MAX_TAGS)
+          : deriveTags(data),
+
       id: `p${Date.now()}`,
 
       creatorId: anonId,
@@ -6667,12 +7892,16 @@ export default function App() {
     setRawPolls((prev) => [toRawPoll(newPoll, anonId), ...prev])
 
     setDoc(doc(db, "polls", newPoll.id), toRawPoll(newPoll, anonId))
+
       .then(() => showToast("🌴 Posted!", 2000))
+
       .catch((err) => {
         console.error("Post poll failed", err)
 
         // Roll back the optimistic insert so no phantom poll lingers
+
         // in the feed after a rejected write.
+
         setRawPolls((prev) => prev.filter((p) => p.id !== newPoll.id))
 
         showToast("Post failed — check your connection", 3500)
@@ -6779,18 +8008,24 @@ export default function App() {
           (p.description?.toLowerCase().includes(q) ?? false) ||
           p.author.toLowerCase().includes(q) ||
           p.options.some((o) => o.toLowerCase().includes(q)) ||
-          p.category.toLowerCase().includes(q)
+          p.tags.some((t) => t.includes(q))
 
-        if (archiveView) return p.expired && matchSearch
+        if (archiveView)
+          return (
+            p.expired &&
+            matchSearch &&
+            (filter === "all" || p.tags.includes(filter))
+          )
 
         if (p.archived) return false
 
         if (showMine && p.creatorId !== anonId) return false
 
-        const matchFilter = filter === "all" || p.category === filter
+        const matchFilter = filter === "all" || p.tags.includes(filter)
 
         return matchFilter && matchSearch
       }),
+
     [archiveView, archivePolls, polls, search, showMine, anonId, filter],
   )
 
@@ -6824,22 +8059,40 @@ export default function App() {
 
         return votesB - votesA
       }),
+
     [filtered, archiveView, archiveSort, sort],
   )
 
   // Everything already on screen during the first paint is "seen": entrance
+
   // animations are reserved for polls that arrive after the page has loaded,
+
   // so a reload at any scroll position never triggers a full-feed strobe.
+
   if (!bootedRef.current && sorted.length > 0) {
     bootedRef.current = true
+
     feedSeenRef.current = new Set(sorted.map((p) => p.id))
   }
 
-  const contentWidth = isNarrow ? "100%" : view === "grid" ? 960 : 620
+  const effectiveView: "list" | "grid" = isNarrow
+    ? "list"
+    : archiveView
+      ? "grid"
+      : viewTouched
+        ? view
+        : "list"
+
+  const gridView = effectiveView === "grid"
+
+  const contentWidth = isNarrow ? "100%" : gridView ? 960 : 620
 
   // Infinite scroll: when the sentinel at the bottom of the feed enters the
+
   // viewport (600px margin), pull the next page. Re-observes whenever the
+
   // list size or active view changes so the sentinel is always wired up.
+
   useEffect(() => {
     const el = sentinelRef.current
 
@@ -6849,6 +8102,7 @@ export default function App() {
       (entries) => {
         if (entries.some((e) => e.isIntersecting)) loadMoreRef.current()
       },
+
       { rootMargin: "600px 0px" },
     )
 
@@ -6927,103 +8181,106 @@ export default function App() {
                       gap: 5,
                     }}
                   >
-                  <button
-                    onClick={() => {
-                      setSearch("")
+                    <button
+                      onClick={() => {
+                        setSearch("")
 
-                      setFilter("all")
+                        setFilter("all")
 
-                      setSort("newest")
+                        setSort("newest")
 
-                      setShowMine(false)
+                        setShowMine(false)
 
-                      setShowArchive(false)
+                        setShowArchive(false)
 
-                      window.scrollTo({ top: 0, behavior: "smooth" })
-                    }}
-                    title="Go to homepage"
-                    style={{
-                      display: "flex",
-
-                      alignItems: "center",
-
-                      gap: 8,
-
-                      background: "none",
-
-                      border: "none",
-
-                      padding: 0,
-
-                      cursor: "pointer",
-                    }}
-                  >
-                    <h1
+                        window.scrollTo({ top: 0, behavior: "smooth" })
+                      }}
+                      title="Go to homepage"
                       style={{
-                        fontFamily: "Satoshi, sans-serif",
+                        display: "flex",
 
-                        fontSize: 22,
+                        alignItems: "center",
 
-                        fontWeight: 900,
+                        gap: 8,
 
-                        background: "var(--gradient)",
+                        background: "none",
 
-                        WebkitBackgroundClip: "text",
+                        border: "none",
 
-                        WebkitTextFillColor: "transparent",
+                        padding: 0,
 
-                        backgroundClip: "text",
-
-                        margin: 0,
-
-                        letterSpacing: "0.04em",
-
-                        textTransform: "uppercase",
+                        cursor: "pointer",
                       }}
                     >
-                      Bageecha
-                    </h1>
-                    <IslandLogo size={18} />
-                  </button>
-                  <span
-                    style={{
-                      fontSize: 10.5,
+                      <h1
+                        className="logo-flow"
+                        style={{
+                          fontFamily: "Satoshi, sans-serif",
 
-                      fontWeight: 800,
+                          fontSize: 22,
 
-                      color: "var(--text-faint)",
+                          fontWeight: 900,
 
-                      letterSpacing: "0.07em",
+                          background: "var(--gradient)",
 
-                      textTransform: "uppercase",
+                          backgroundSize: "200% auto",
 
-                      display: "flex",
+                          WebkitBackgroundClip: "text",
 
-                      alignItems: "center",
+                          WebkitTextFillColor: "transparent",
 
-                      gap: 6,
+                          backgroundClip: "text",
 
-                      lineHeight: 1,
+                          margin: 0,
 
-                      whiteSpace: "nowrap",
-                    }}
-                  >
+                          letterSpacing: "0.04em",
+
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        Bageecha
+                      </h1>
+                      <IslandLogo size={18} />
+                    </button>
                     <span
-                      className="pulse-dot"
                       style={{
-                        width: 5,
+                        fontSize: 10.5,
 
-                        height: 5,
+                        fontWeight: 800,
 
-                        borderRadius: "50%",
+                        color: "var(--text-faint)",
 
-                        background: "var(--primary)",
+                        letterSpacing: "0.07em",
 
-                        display: "inline-block",
+                        textTransform: "uppercase",
+
+                        display: "flex",
+
+                        alignItems: "center",
+
+                        gap: 6,
+
+                        lineHeight: 1,
+
+                        whiteSpace: "nowrap",
                       }}
-                    />
-                    {liveCount.toLocaleString()} islanders online
-                  </span>
+                    >
+                      <span
+                        className="pulse-dot"
+                        style={{
+                          width: 5,
+
+                          height: 5,
+
+                          borderRadius: "50%",
+
+                          background: "var(--primary)",
+
+                          display: "inline-block",
+                        }}
+                      />
+                      {liveCount.toLocaleString()} islanders online
+                    </span>
                   </div>
                   <div
                     style={{
@@ -7033,55 +8290,20 @@ export default function App() {
 
                       alignItems: "center",
 
-                      gap: 6,
+                      gap: 8,
                     }}
                   >
                     <button
-                      onClick={() => {
-                        setShowMine(!showMine)
-
-                        setShowArchive(false)
-
-                        setShowModal(false)
-                      }}
-                      title="My polls"
+                      onClick={() => setShowArchive(true)}
+                      title="View results"
                       style={{
-                        background: showMine ? "var(--surface-2)" : "none",
-
-                        border: showMine
-                          ? "1px solid var(--primary-soft)"
-                          : "1px solid var(--border)",
-
-                        borderRadius: 10,
-
-                        height: 40,
-
-                        minWidth: 40,
-
-                        padding: 0,
-
-                        lineHeight: 1,
-
-                        color: showMine ? "var(--primary)" : "var(--text-dim)",
-
-                        cursor: "pointer",
-
-                        transition: "all 0.15s",
-
                         display: "flex",
 
                         alignItems: "center",
 
-                        justifyContent: "center",
-                      }}
-                    >
-                      <PersonIcon size={19} />
-                    </button>
-                    <button
-                      onClick={() => setShowRules(true)}
-                      title="Rules"
-                      style={{
-                        background: "none",
+                        gap: 5,
+
+                        background: "var(--surface)",
 
                         border: "1px solid var(--border)",
 
@@ -7089,167 +8311,43 @@ export default function App() {
 
                         height: 40,
 
-                        minWidth: 40,
-
-                        padding: 0,
+                        padding: "0 14px",
 
                         lineHeight: 1,
 
                         color: "var(--text-dim)",
 
-                        cursor: "pointer",
+                        fontFamily: "Satoshi, sans-serif",
 
-                        display: "flex",
+                        fontWeight: 800,
 
-                        alignItems: "center",
-
-                        justifyContent: "center",
-                      }}
-                    >
-                      <RulesIcon size={19} />
-                    </button>
-                    {isAdmin ? (
-                      <button
-                        onClick={handleAdminLogout}
-                        title={user?.email ?? "Signed in"}
-                        style={{
-                          background: "var(--surface-2)",
-
-                          border: "1px solid var(--accent-soft)",
-
-                          borderRadius: 10,
-
-                          height: 40,
-
-                          minWidth: 40,
-
-                          padding: 0,
-
-                          lineHeight: 1,
-
-                          color: "var(--accent)",
-
-                          cursor: "pointer",
-
-                          display: "flex",
-
-                          alignItems: "center",
-
-                          justifyContent: "center",
-                        }}
-                      >
-                        <KeyIcon size={19} />
-                      </button>
-                    ) : (
-                      <button
-                        onClick={handleAdminLogin}
-                        title="Admin sign-in"
-                        style={{
-                          background: "none",
-
-                          border: "1px solid var(--border)",
-
-                          borderRadius: 10,
-
-                          height: 40,
-
-                          minWidth: 40,
-
-                          padding: 0,
-
-                          lineHeight: 1,
-
-                          color: "var(--text-dim)",
-
-                          cursor: "pointer",
-
-                          display: "flex",
-
-                          alignItems: "center",
-
-                          justifyContent: "center",
-                        }}
-                      >
-                        <KeyIcon size={19} />
-                      </button>
-                    )}
-                    <button
-                      onClick={() => {
-                        setShowArchive(!showArchive)
-
-                        setShowMine(false)
-
-                        setShowModal(false)
-                      }}
-                      title="Archive"
-                      style={{
-                        position: "relative",
-
-                        background: "var(--surface-2)",
-
-                        border: showArchive
-                          ? "1.5px solid var(--accent)"
-                          : "1px solid var(--accent-soft)",
-
-                        borderRadius: 10,
-
-                        height: 40,
-
-                        minWidth: 40,
-
-                        padding: 0,
-
-                        lineHeight: 1,
-
-                        color: "var(--accent)",
+                        fontSize: 13.5,
 
                         cursor: "pointer",
 
                         transition: "all 0.15s",
-
-                        display: "flex",
-
-                        alignItems: "center",
-
-                        justifyContent: "center",
                       }}
                     >
-                      <span style={{ position: "relative" }}>
-                        <ArchiveIcon size={19} />
-                        {archiveClosed.length > 0 && (
-                          <span
-                            style={{
-                              position: "absolute",
-
-                              top: -6,
-
-                              right: -10,
-
-                              background: "var(--accent)",
-
-                              color: "var(--bg)",
-
-                              fontSize: 9,
-
-                              fontWeight: 900,
-
-                              lineHeight: 1.3,
-
-                              padding: "1.5px 4px",
-
-                              borderRadius: 99,
-
-                              minWidth: 15,
-
-                              textAlign: "center",
-                            }}
-                          >
-                            {archiveClosed.length}
-                          </span>
-                        )}
-                      </span>
+                      <ArchiveIcon size={15} />
+                      Results
                     </button>
-                    <ThemePicker theme={theme} onChange={setTheme} compact />
+                    <ThemeSwatchButton theme={theme} compact onOpen={() => setShowTheme(true)} />
+                    <UserMenu
+                      isAdmin={isAdmin}
+                      userEmail={user?.email}
+                      onMyPolls={() => {
+                        setShowMine(!showMine)
+
+                        setShowArchive(false)
+
+                        setShowModal(false)
+
+                        window.scrollTo({ top: 0, behavior: "smooth" })
+                      }}
+                      onRules={() => setShowRules(true)}
+                      onSignIn={handleAdminLogin}
+                      onSignOut={handleAdminLogout}
+                    />
                   </div>
                 </div>
               </>
@@ -7307,31 +8405,34 @@ export default function App() {
                       cursor: "pointer",
                     }}
                   >
-                    <h1
-                      style={{
-                        fontFamily: "Satoshi, sans-serif",
+<h1
+                        className="logo-flow"
+                        style={{
+                          fontFamily: "Satoshi, sans-serif",
 
-                        fontSize: view === "grid" ? 30 : 24,
+                          fontSize: 22,
 
-                        fontWeight: 900,
+                          fontWeight: 900,
 
-                        background: "var(--gradient)",
+                          background: "var(--gradient)",
 
-                        WebkitBackgroundClip: "text",
+                          backgroundSize: "200% auto",
 
-                        WebkitTextFillColor: "transparent",
+                          WebkitBackgroundClip: "text",
 
-                        backgroundClip: "text",
+                          WebkitTextFillColor: "transparent",
 
-                        margin: 0,
+                          backgroundClip: "text",
 
-                        letterSpacing: "0.04em",
+                          margin: 0,
 
-                        textTransform: "uppercase",
-                      }}
-                    >
-                      Bageecha
-                    </h1>
+                          letterSpacing: "0.04em",
+
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        Bageecha
+                      </h1>
                     <IslandLogo size={19} />
                   </button>
                   <span
@@ -7386,12 +8487,17 @@ export default function App() {
                     gap: 10,
                   }}
                 >
-                  <ThemePicker theme={theme} onChange={setTheme} />
                   <button
-                    onClick={() => setShowRules(true)}
-                    title="Rules"
+                    onClick={() => setShowArchive(true)}
+                    title="View results"
                     style={{
-                      background: "none",
+                      display: "flex",
+
+                      alignItems: "center",
+
+                      gap: 5,
+
+                      background: "var(--surface)",
 
                       border: "1px solid var(--border)",
 
@@ -7399,9 +8505,7 @@ export default function App() {
 
                       height: 36,
 
-                      minWidth: 36,
-
-                      padding: "0 10px",
+                      padding: "0 16px",
 
                       lineHeight: 1,
 
@@ -7411,347 +8515,162 @@ export default function App() {
 
                       fontWeight: 800,
 
-                      fontSize: 14,
+                      fontSize: 13,
 
                       cursor: "pointer",
 
-                      display: "flex",
-
-                      alignItems: "center",
-
-                      justifyContent: "center",
+                      transition: "all 0.15s",
                     }}
                   >
-                    <RulesIcon size={17} />
+                    <ArchiveIcon size={15} />
+                    Results
                   </button>
-                  {isAdmin ? (
-                    <button
-                      onClick={handleAdminLogout}
-                      title={`Signed in as ${user?.email ?? ""} — click to sign out`}
-                      style={{
-                        background: "var(--surface-2)",
-
-                        border: "1px solid var(--accent-soft)",
-
-                        borderRadius: 9,
-
-                        height: 36,
-
-                        minWidth: 36,
-
-                        padding: "0 10px",
-
-                        lineHeight: 1,
-
-                        color: "var(--accent)",
-
-                        fontFamily: "Satoshi, sans-serif",
-
-                        fontWeight: 800,
-
-                        fontSize: 14,
-
-                        cursor: "pointer",
-
-                        display: "flex",
-
-                        alignItems: "center",
-
-                        justifyContent: "center",
-                      }}
-                    >
-                      <KeyIcon size={17} />
-                    </button>
-                  ) : (
-                    <button
-                      onClick={handleAdminLogin}
-                      title="Admin sign-in (Google)"
-                      style={{
-                        background: "none",
-
-                        border: "1px solid var(--border)",
-
-                        borderRadius: 9,
-
-                        height: 36,
-
-                        minWidth: 36,
-
-                        padding: "0 10px",
-
-                        lineHeight: 1,
-
-                        color: "var(--text-dim)",
-
-                        fontFamily: "Satoshi, sans-serif",
-
-                        fontWeight: 800,
-
-                        fontSize: 14,
-
-                        cursor: "pointer",
-
-                        display: "flex",
-
-                        alignItems: "center",
-
-                        justifyContent: "center",
-                      }}
-                    >
-                      <KeyIcon size={17} />
-                    </button>
-                  )}
-                  <button
-                    onClick={() => {
+                  <ThemeSwatchButton theme={theme} onOpen={() => setShowTheme(true)} />
+                  <UserMenu
+                    isAdmin={isAdmin}
+                    userEmail={user?.email}
+                    onMyPolls={() => {
                       setShowMine(!showMine)
 
                       setShowArchive(false)
 
                       setShowModal(false)
+
+                      window.scrollTo({ top: 0, behavior: "smooth" })
                     }}
-                    title="My polls"
-                    style={{
-                      background: showMine ? "var(--surface-2)" : "none",
-
-                      border: showMine
-                        ? "1px solid var(--primary-soft)"
-                        : "1px solid var(--border)",
-
-                      borderRadius: 9,
-
-                      height: 36,
-
-                      minWidth: 36,
-
-                      padding: "0 10px",
-
-                      lineHeight: 1,
-
-                      color: showMine ? "var(--primary)" : "var(--text-dim)",
-
-                      fontFamily: "Satoshi, sans-serif",
-
-                      fontWeight: 800,
-
-                      fontSize: 14,
-
-                      cursor: "pointer",
-
-                      transition: "all 0.15s",
-
-                      display: "flex",
-
-                      alignItems: "center",
-
-                      justifyContent: "center",
-                    }}
-                  >
-                    <PersonIcon size={17} />
-                  </button>
-                  <button
-                    onClick={() => {
-                      setShowArchive(!showArchive)
-
-                      setShowMine(false)
-
-                      setShowModal(false)
-                    }}
-                    title="Archive"
-                    style={{
-                      background: showArchive ? "var(--surface-2)" : "none",
-
-                      border: showArchive
-                        ? "1px solid var(--accent-soft)"
-                        : "1px solid var(--border)",
-
-                      borderRadius: 9,
-
-                      height: 36,
-
-                      minWidth: 36,
-
-                      padding: "0 10px",
-
-                      lineHeight: 1,
-
-                      color: showArchive
-                        ? "var(--accent)"
-                        : "var(--text-dim)",
-
-                      fontFamily: "Satoshi, sans-serif",
-
-                      fontWeight: 800,
-
-                      fontSize: 14,
-
-                      cursor: "pointer",
-
-                      transition: "all 0.15s",
-
-                      display: "flex",
-
-                      alignItems: "center",
-
-                      justifyContent: "center",
-                    }}
-                  >
-                    <ArchiveIcon size={17} />
-                  </button>
-                  <button
-                    onClick={() => setShowModal(true)}
-                    style={{
-                      background: "var(--gradient)",
-
-                      border: "none",
-
-                      borderRadius: 9,
-
-                      height: 36,
-
-                      padding: "0 20px",
-
-                      lineHeight: 1,
-
-                      color: "#fff",
-
-                      fontFamily: "Satoshi, sans-serif",
-
-                      fontWeight: 900,
-
-                      fontSize: 13.5,
-
-                      cursor: "pointer",
-
-                      boxShadow: "0 4px 18px var(--primary-glow-strong)",
-                    }}
-                  >
-                    + Poll
-                  </button>
+                    onRules={() => setShowRules(true)}
+                    onSignIn={handleAdminLogin}
+                    onSignOut={handleAdminLogout}
+                  />
                 </div>
               </div>
             )}
 
-            {/* Cove search */}
-            <div
-              style={{
-                paddingTop: isNarrow ? 2 : 8,
-                paddingBottom: isNarrow ? 12 : 16,
-              }}
-            >
+            {/* Cove search — hidden on mobile main feed where search lives
+                inline next to the tags/sort controls */}
+            {!(isNarrow && !archiveView) && (
               <div
                 style={{
-                  position: "relative",
+                  paddingTop: isNarrow ? 5 : 11,
 
-                  borderRadius: 99,
-
-                  padding: "1.5px",
-
-                  background:
-                    "linear-gradient(120deg, var(--primary-soft) 0%, var(--accent-soft) 50%, var(--primary-soft) 100%)",
-
-                  boxShadow: searchActive
-                    ? "0 10px 36px var(--primary-glow-strong)"
-                    : "none",
-
-                  transition: "box-shadow 0.25s",
+                  paddingBottom: isNarrow ? 12 : 16,
                 }}
               >
-                <div style={{ position: "relative" }}>
-                  <span
-                    style={{
-                      position: "absolute",
+                <div
+                  style={{
+                    position: "relative",
 
-                      left: isNarrow ? 15 : 18,
+                    borderRadius: 99,
 
-                      top: "50%",
+                    padding: "1.5px",
 
-                      transform: "translateY(-50%)",
+                    background:
+                      "linear-gradient(120deg, var(--primary-soft) 0%, var(--accent-soft) 50%, var(--primary-soft) 100%)",
 
-                      pointerEvents: "none",
+                    boxShadow: searchActive
+                      ? "0 10px 36px var(--primary-glow-strong)"
+                      : "none",
 
-                      opacity: 0.6,
-
-                      color: "var(--text-muted)",
-                    }}
-                  >
-                    <SearchIcon size={isNarrow ? 14 : 15} />
-                  </span>
-                  <input
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                    placeholder={searchPh}
-                    onFocus={() => {
-                      searchFocusedRef.current = true
-
-                      setSearchActive(true)
-                    }}
-                    onBlur={() => {
-                      searchFocusedRef.current = false
-
-                      setSearchActive(false)
-                    }}
-                    style={{
-                      width: "100%",
-
-                      background: "var(--bg-92)",
-
-                      border: "none",
-
-                      outline: "none",
-
-                      borderRadius: 99,
-
-                      padding: isNarrow ? "10px 40px" : "14px 46px",
-
-                      color: "var(--text)",
-
-                      fontSize: isNarrow ? 14 : 15,
-
-                      fontFamily: "Satoshi, sans-serif",
-
-                      fontWeight: 700,
-                    }}
-                  />
-                  {search && (
-                    <button
-                      onClick={() => setSearch("")}
-                      title="Clear search"
+                    transition: "box-shadow 0.25s",
+                  }}
+                >
+                  <div style={{ position: "relative" }}>
+                    <span
                       style={{
                         position: "absolute",
 
-                        right: 12,
+                        left: isNarrow ? 15 : 18,
 
                         top: "50%",
 
                         transform: "translateY(-50%)",
 
-                        background: "var(--surface-2)",
+                        pointerEvents: "none",
+
+                        opacity: 0.6,
+
+                        color: "var(--text-muted)",
+                      }}
+                    >
+                      <SearchIcon size={isNarrow ? 14 : 15} />
+                    </span>
+                    <input
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      placeholder={searchPh}
+                      onFocus={() => {
+                        searchFocusedRef.current = true
+
+                        setSearchActive(true)
+                      }}
+                      onBlur={() => {
+                        searchFocusedRef.current = false
+
+                        setSearchActive(false)
+                      }}
+                      style={{
+                        width: "100%",
+
+                        background: "var(--bg-92)",
 
                         border: "none",
 
+                        outline: "none",
+
                         borderRadius: 99,
 
-                        color: "var(--text-muted)",
+                        padding: isNarrow ? "10px 40px" : "14px 46px",
 
-                        cursor: "pointer",
+                        color: "var(--text)",
 
-                        fontSize: 12,
-
-                        lineHeight: 1,
-
-                        padding: "6px 9px",
+                        fontSize: isNarrow ? 14 : 15,
 
                         fontFamily: "Satoshi, sans-serif",
 
-                        fontWeight: 800,
+                        fontWeight: 700,
                       }}
-                    >
-                      ✕
-                    </button>
-                  )}
+                    />
+                    {search && (
+                      <button
+                        onClick={() => setSearch("")}
+                        title="Clear search"
+                        style={{
+                          position: "absolute",
+
+                          right: 12,
+
+                          top: "50%",
+
+                          transform: "translateY(-50%)",
+
+                          background: "var(--surface-2)",
+
+                          border: "none",
+
+                          borderRadius: 99,
+
+                          color: "var(--text-muted)",
+
+                          cursor: "pointer",
+
+                          fontSize: 12,
+
+                          lineHeight: 1,
+
+                          padding: "6px 9px",
+
+                          fontFamily: "Satoshi, sans-serif",
+
+                          fontWeight: 800,
+                        }}
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
           </div>
         </header>
 
@@ -7787,217 +8706,127 @@ export default function App() {
                     flexWrap: "wrap",
                   }}
                 >
-                <span
-                  style={{
-                    fontSize: 11,
+                  <span
+                    style={{
+                      fontSize: 11,
 
-                    fontWeight: 900,
+                      fontWeight: 900,
 
-                    color: "var(--accent)",
+                      color: "var(--accent)",
 
-                    letterSpacing: "0.08em",
+                      letterSpacing: "0.08em",
 
-                    textTransform: "uppercase",
+                      textTransform: "uppercase",
 
-                    display: "flex",
+                      display: "flex",
 
-                    alignItems: "center",
+                      alignItems: "center",
 
-                    gap: 6,
-                  }}
-                >
-                  <ArchiveIcon size={14} /> Closed Polls
-                </span>
-                <span
-                  style={{
-                    fontSize: 12,
+                      gap: 6,
+                    }}
+                  >
+                    <ArchiveIcon size={14} /> Results
+                  </span>
+                  <span
+                    style={{
+                      fontSize: 12,
 
-                    fontWeight: 700,
+                      fontWeight: 700,
 
-                    color: "var(--text-dim)",
-                  }}
-                >
-                  {sorted.length} closed poll{sorted.length !== 1 ? "s" : ""}
-                </span>
-                <button
-                  onClick={() => setShowArchive(false)}
-                  style={{
-                    marginLeft: "auto",
+                      color: "var(--text-dim)",
+                    }}
+                  >
+                    {sorted.length} closed poll{sorted.length !== 1 ? "s" : ""}
+                  </span>
+                  {archiveView &&
+                    (() => {
+                      const totalVotes = archiveClosed.reduce(
+                        (s, p) => s + p.votes.reduce((a, v) => a + v, 0),
 
-                    background: "none",
+                        0,
+                      )
 
-                    border: "1px solid var(--border)",
-
-                    borderRadius: 9,
-
-                    padding: "6px 14px",
-
-                    color: "var(--text-dim)",
-
-                    fontFamily: "Satoshi, sans-serif",
-
-                    fontWeight: 800,
-
-                    fontSize: 12,
-
-                    cursor: "pointer",
-
-                    transition: "all 0.15s",
-                  }}
-                >
-                  ← Back to feed
-                </button>
-              </div>
-              <div
-                style={{
-                  display: "flex",
-
-                  alignItems: "center",
-
-                  gap: 8,
-
-                  marginBottom: isNarrow ? 4 : 6,
-
-                  flexWrap: isNarrow ? "nowrap" : "wrap",
-                }}
-              >
-                {!isNarrow && (
-                <span
-                  style={{
-                    fontSize: 10,
-
-                    fontWeight: 700,
-
-                    color: "var(--text-faint)",
-
-                    letterSpacing: "0.08em",
-
-                    textTransform: "uppercase",
-                  }}
-                >
-                  Sort by
-                </span>
-                )}
-                <div
-                  style={{
-                    display: "flex",
-
-                    background: "var(--surface)",
-
-                    border: "1px solid var(--border)",
-
-                    borderRadius: isNarrow ? 9 : 10,
-
-                    padding: isNarrow ? 2 : 3,
-
-                    maxWidth: isNarrow ? "100%" : "none",
-
-                    overflowX: isNarrow ? "auto" : "visible",
-                  }}
-                >
-                  {([
-                    { value: "newest", label: "Newest", Icon: ClockIcon },
-                    { value: "mostVoted", label: "Most Voted", Icon: ChartIcon },
-                  ] as const).map((opt) => {
-                    const active = archiveSort === opt.value
-
-                    return (
-                      <button
-                        key={opt.value}
-                        onClick={() => setArchiveSort(opt.value)}
-                        style={{
-                          background: active
-                            ? "var(--primary-soft-bg)"
-                            : "transparent",
-
-                          color: active
-                            ? "var(--primary)"
-                            : "var(--text-muted)",
-
-                          border: "none",
-
-                          borderRadius: isNarrow ? 7 : 8,
-
-                          padding: isNarrow ? "5px 9px" : "6px 11px",
-
-                          fontFamily: "Satoshi, sans-serif",
-
-                          fontWeight: 800,
-
-                          fontSize: isNarrow ? 11.5 : 12,
-
-                          cursor: "pointer",
-
-                          transition: "all 0.15s",
-
-                          whiteSpace: "nowrap",
-
-                          flexShrink: 0,
-                        }}
-                      >
+                      return (
                         <span
                           style={{
                             display: "flex",
 
                             alignItems: "center",
 
-                            gap: isNarrow ? 4 : 5,
+                            flexWrap: "wrap",
+
+                            gap: 6,
+
+                            fontSize: 12,
+
+                            fontWeight: 700,
+
+                            color: "var(--text-dim)",
                           }}
                         >
-                          <opt.Icon size={isNarrow ? 12 : 13} />
-                          {opt.label}
+                          <span aria-hidden>·</span>
+                          {totalVotes} votes cast
                         </span>
-                      </button>
-                    )
-                  })}
+                      )
+                    })()}
+                  <button
+                    onClick={() => setShowArchive(false)}
+                    style={{
+                      marginLeft: "auto",
+
+                      background: "none",
+
+                      border: "1px solid var(--border)",
+
+                      borderRadius: 9,
+
+                      padding: "6px 14px",
+
+                      color: "var(--text-dim)",
+
+                      fontFamily: "Satoshi, sans-serif",
+
+                      fontWeight: 800,
+
+                      fontSize: 12,
+
+                      cursor: "pointer",
+
+                      transition: "all 0.15s",
+                    }}
+                  >
+                    ← Back to feed
+                  </button>
                 </div>
-              </div>
-              </>
-            ) : (
-              <div
-                style={{
-                  display: "flex",
-
-                  alignItems: "center",
-
-                  gap: 8,
-
-                  marginBottom: isNarrow ? 4 : 6,
-
-                  flexWrap: "nowrap",
-                }}
-              >
                 <div
                   style={{
                     display: "flex",
 
                     alignItems: "center",
 
-                    gap: 6,
+                    gap: 8,
 
-                    flex: 1,
+                    marginBottom: isNarrow ? 4 : 6,
 
-                    minWidth: 0,
-
-                    flexWrap: "nowrap",
+                    flexWrap: isNarrow ? "nowrap" : "wrap",
                   }}
                 >
                   {!isNarrow && (
-                  <span
-                    style={{
-                      fontSize: 10,
+                    <span
+                      style={{
+                        fontSize: 10,
 
-                      fontWeight: 700,
+                        fontWeight: 700,
 
-                      color: "var(--text-faint)",
+                        color: "var(--text-faint)",
 
-                      letterSpacing: "0.06em",
+                        letterSpacing: "0.08em",
 
-                      textTransform: "uppercase",
-                    }}
-                  >
-                    Sort by
-                  </span>
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      Sort by
+                    </span>
                   )}
                   <div
                     style={{
@@ -8007,27 +8836,30 @@ export default function App() {
 
                       border: "1px solid var(--border)",
 
-                      borderRadius: 9,
+                      borderRadius: isNarrow ? 9 : 10,
 
-                      padding: 2,
+                      padding: isNarrow ? 2 : 3,
 
-                      maxWidth: "100%",
+                      maxWidth: isNarrow ? "100%" : "none",
 
-                      overflowX: "auto",
+                      overflowX: isNarrow ? "auto" : "visible",
                     }}
                   >
-                  {([
-                    { value: "trending", label: "Trending", Icon: TrendingUpIcon },
-                    { value: "popular", label: "Popular", Icon: StarIcon },
-                    { value: "newest", label: "Newest", Icon: ClockIcon },
-                    { value: "mostVoted", label: "Most Voted", Icon: ChartIcon },
-                  ] as const).map((opt) => {
-                    const active = sort === opt.value
+                    {([
+                      { value: "newest", label: "Newest", Icon: ClockIcon },
+
+                      {
+                        value: "mostVoted",
+                        label: "Most Voted",
+                        Icon: ChartIcon,
+                      },
+                    ] as const).map((opt) => {
+                      const active = archiveSort === opt.value
 
                       return (
                         <button
                           key={opt.value}
-                          onClick={() => setSort(opt.value)}
+                          onClick={() => setArchiveSort(opt.value)}
                           style={{
                             background: active
                               ? "var(--primary-soft-bg)"
@@ -8039,15 +8871,15 @@ export default function App() {
 
                             border: "none",
 
-                            borderRadius: 7,
+                            borderRadius: isNarrow ? 7 : 8,
 
-                            padding: "5px 9px",
+                            padding: isNarrow ? "5px 9px" : "6px 11px",
 
                             fontFamily: "Satoshi, sans-serif",
 
                             fontWeight: 800,
 
-                            fontSize: 11.5,
+                            fontSize: isNarrow ? 11.5 : 12,
 
                             cursor: "pointer",
 
@@ -8057,26 +8889,450 @@ export default function App() {
 
                             flexShrink: 0,
                           }}
-                      >
-                        <span
-                          style={{
-                            display: "flex",
-
-                            alignItems: "center",
-
-                            gap: 4,
-                          }}
                         >
-                          <opt.Icon size={12} />
-                          {opt.label}
-                        </span>
-                      </button>
-                    )
-                  })}
-                </div>
-              </div>
+                          <span
+                            style={{
+                              display: "flex",
 
-              <div style={{ position: "relative", flexShrink: 0 }}>
+                              alignItems: "center",
+
+                              gap: isNarrow ? 4 : 5,
+                            }}
+                          >
+                            <opt.Icon size={isNarrow ? 12 : 13} />
+                            {opt.label}
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div
+                style={{
+                  display: "flex",
+
+                  alignItems: "center",
+
+                  gap: 10,
+
+                  marginBottom: isNarrow ? 6 : 8,
+
+                  flexWrap: "nowrap",
+                }}
+              >
+                {isNarrow && (
+                  <div
+                    style={{
+                      position: "relative",
+
+                      flex: 1,
+
+                      minWidth: 0,
+                    }}
+                  >
+                    <span
+                      style={{
+                        position: "absolute",
+
+                        left: 11,
+
+                        top: "50%",
+
+                        transform: "translateY(-50%)",
+
+                        pointerEvents: "none",
+
+                        opacity: 0.6,
+
+                        color: "var(--text-muted)",
+                      }}
+                    >
+                      <SearchIcon size={13} />
+                    </span>
+                    <input
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      placeholder={searchPh}
+                      onFocus={() => {
+                        searchFocusedRef.current = true
+
+                        setSearchActive(true)
+                      }}
+                      onBlur={() => {
+                        searchFocusedRef.current = false
+
+                        setSearchActive(false)
+                      }}
+                      style={{
+                        width: "100%",
+
+                        background: "var(--bg-92)",
+
+                        border: "none",
+
+                        outline: "none",
+
+                        borderRadius: 99,
+
+                        padding: "8px 28px",
+
+                        color: "var(--text)",
+
+                        fontSize: 12.5,
+
+                        fontFamily: "Satoshi, sans-serif",
+
+                        fontWeight: 700,
+                      }}
+                    />
+                    {search && (
+                      <button
+                        onClick={() => setSearch("")}
+                        title="Clear search"
+                        style={{
+                          position: "absolute",
+
+                          right: 8,
+
+                          top: "50%",
+
+                          transform: "translateY(-50%)",
+
+                          background: "var(--surface-2)",
+
+                          border: "none",
+
+                          borderRadius: 99,
+
+                          color: "var(--text-muted)",
+
+                          cursor: "pointer",
+
+                          fontSize: 10,
+
+                          lineHeight: 1,
+
+                          padding: "4px 6px",
+
+                          fontFamily: "Satoshi, sans-serif",
+
+                          fontWeight: 800,
+                        }}
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                )}
+                {isNarrow && (
+                  <div style={{ position: "relative", flexShrink: 0 }}>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+
+                        setMobileTagsOpen(!mobileTagsOpen)
+                      }}
+                      className="tag-pill"
+                      style={{
+                        display: "flex",
+
+                        alignItems: "center",
+
+                        gap: 5,
+
+                        background: "var(--surface)",
+
+                        color: "var(--text-muted)",
+
+                        padding: "7px 9px",
+
+                        borderRadius: 99,
+
+                        border: "1px solid var(--border)",
+
+                        cursor: "pointer",
+
+                        transition: "all 0.15s",
+
+                        fontFamily: "Satoshi, sans-serif",
+
+                        fontWeight: 800,
+
+                        fontSize: 11.5,
+
+                        boxShadow: "none",
+                      }}
+                    >
+                      <span
+                        style={{
+                          whiteSpace: "nowrap",
+
+                          maxWidth: 90,
+
+                          overflow: "hidden",
+
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {filters.find((f) => String(f.value) === filter)
+                          ?.label ?? "All"}
+                      </span>
+                      <span
+                        style={{
+                          fontSize: 9,
+
+                          opacity: 0.7,
+
+                          transform: mobileTagsOpen ? "rotate(180deg)" : "none",
+
+                          transition: "transform 0.15s",
+                        }}
+                      >
+                        ▼
+                      </span>
+                    </button>
+                    {mobileTagsOpen && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        style={{
+                          position: "absolute",
+
+                          right: 0,
+
+                          top: "calc(100% + 8px)",
+
+                          zIndex: 61,
+
+                          background: "var(--surface-2)",
+
+                          border: "1px solid var(--border)",
+
+                          borderRadius: 14,
+
+                          padding: 6,
+
+                          minWidth: 160,
+
+                          width: "max-content",
+
+                          maxWidth: "calc(100vw - 28px)",
+
+                          maxHeight: 320,
+
+                          overflowY: "auto",
+
+                          overflowX: "hidden",
+
+                          boxShadow: "0 16px 40px rgba(0,0,0,0.5)",
+                        }}
+                      >
+                        {filters.map((f) => {
+                          const fv = String(f.value)
+
+                          const active = filter === fv
+
+                          return (
+                            <button
+                              key={fv}
+                              onClick={() => {
+                                setFilter(fv)
+
+                                setMobileTagsOpen(false)
+                              }}
+                              style={{
+                                display: "flex",
+
+                                alignItems: "center",
+
+                                gap: 8,
+
+                                width: "100%",
+
+                                background: active
+                                  ? "var(--bg)"
+                                  : "transparent",
+
+                                color: active
+                                  ? "var(--primary)"
+                                  : "var(--text-dim)",
+
+                                border: "none",
+
+                                borderRadius: 9,
+
+                                padding: "8px 12px",
+
+                                fontFamily: "Satoshi, sans-serif",
+
+                                fontWeight: 700,
+
+                                fontSize: 13,
+
+                                textAlign: "left",
+
+                                cursor: "pointer",
+                              }}
+                            >
+                              <span
+                                style={{
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                {String(f.label)}
+                              </span>
+                              {active && (
+                                <span
+                                  style={{
+                                    marginLeft: "auto",
+
+                                    color: "var(--primary)",
+
+                                    fontSize: 12,
+                                  }}
+                                >
+                                  ✓
+                                </span>
+                              )}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {!isNarrow && (
+                  <div
+                    style={{
+                      display: "flex",
+
+                      alignItems: "center",
+
+                      gap: 6,
+
+                      flex: 1,
+
+                      minWidth: 0,
+
+                      flexWrap: "nowrap",
+                    }}
+                  >
+                    <div
+                      ref={(el) => {
+                        if (!el) return
+
+                        el.onwheel = (e) => {
+                          const canScroll = el.scrollWidth > el.clientWidth
+
+                          if (
+                            !canScroll ||
+                            Math.abs(e.deltaY) <= Math.abs(e.deltaX)
+                          )
+                            return
+
+                          e.preventDefault()
+
+                          el.scrollLeft += e.deltaY
+                        }
+                      }}
+                      style={{
+                        display: "flex",
+
+                        flex: 1,
+
+                        minWidth: 0,
+
+                        background: "var(--surface)",
+
+                        border: "1px solid var(--border)",
+
+                        borderRadius: 9,
+
+                        padding: 2,
+
+                        width: "100%",
+
+                        overflowX: "auto",
+
+                        overflowY: "hidden",
+
+                        scrollbarWidth: "none",
+
+                        userSelect: "none",
+
+                        WebkitUserSelect: "none",
+                      }}
+                    >
+                      {filters.map((f, i) => {
+                        const fv = String(f.value)
+
+                        const active = filter === fv
+
+                        return (
+                          <Fragment key={fv}>
+                            {i > 0 && (
+                              <span
+                                aria-hidden
+                                style={{
+                                  width: 1,
+
+                                  alignSelf: "stretch",
+
+                                  background: "var(--border)",
+
+                                  margin: "3px 1px",
+                                }}
+                              />
+                            )}
+                            <button
+                              onClick={() => setFilter(fv)}
+                              style={{
+                                display: "flex",
+
+                                alignItems: "center",
+
+                                justifyContent: "center",
+
+                                background: active
+                                  ? "var(--primary-soft-bg)"
+                                  : "transparent",
+
+                                color: active
+                                  ? "var(--primary)"
+                                  : "var(--text-muted)",
+
+                                border: "none",
+
+                                borderRadius: 7,
+
+                                padding: "5px 10px",
+
+                                fontFamily: "Satoshi, sans-serif",
+
+                                fontWeight: 800,
+
+                                fontSize: isNarrow ? 11 : 11.5,
+
+                                cursor: "pointer",
+
+                                transition: "all 0.15s",
+
+                                whiteSpace: "nowrap",
+
+                                flexShrink: 0,
+                              }}
+                            >
+                              {String(f.label)}
+                            </button>
+                          </Fragment>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ position: "relative", flexShrink: 0 }}>
                   <button
                     onClick={(e) => {
                       e.stopPropagation()
@@ -8089,24 +9345,17 @@ export default function App() {
 
                       alignItems: "center",
 
-                      gap: 7,
+                      gap: 6,
 
-                      background:
-                        filter !== "all"
-                          ? "var(--primary-soft-bg)"
-                          : "var(--surface)",
+                      background: "var(--surface)",
 
-                      color:
-                        filter !== "all" ? "var(--primary)" : "var(--text-muted)",
+                      color: "var(--text-muted)",
 
-                      padding: "7px 14px",
+                      padding: "7px 10px",
 
                       borderRadius: 99,
 
-                      border:
-                        filter !== "all"
-                          ? "1px solid var(--primary-soft)"
-                          : "1px solid var(--border)",
+                      border: "1px solid var(--border)",
 
                       cursor: "pointer",
 
@@ -8130,10 +9379,15 @@ export default function App() {
                         gap: 6,
                       }}
                     >
-                      {filter !== "all" && (
-                        <CategoryIcon cat={filter} size={13} />
-                      )}
-                      {filters.find((f) => f.value === filter)?.label ?? "All"}
+                      {(() => {
+                        const cur =
+                          FEED_SORTS.find((o) => o.value === sort) ??
+                          FEED_SORTS[0]
+
+                        const CurIcon = cur.Icon
+
+                        return <CurIcon size={15} />
+                      })()}
                     </span>
                     <span
                       style={{
@@ -8155,7 +9409,9 @@ export default function App() {
                       style={{
                         position: "absolute",
 
-                        left: 0,
+                        left: isNarrow ? "auto" : 0,
+
+                        right: isNarrow ? 0 : "auto",
 
                         top: "calc(100% + 8px)",
 
@@ -8171,21 +9427,27 @@ export default function App() {
 
                         minWidth: 190,
 
+                        width: "max-content",
+
+                        maxWidth: isNarrow ? "calc(100vw - 28px)" : 380,
+
                         maxHeight: 320,
 
                         overflowY: "auto",
 
+                        overflowX: "hidden",
+
                         boxShadow: "0 16px 40px rgba(0,0,0,0.5)",
                       }}
                     >
-                      {filters.map((f) => {
-                        const active = filter === f.value
+                      {FEED_SORTS.map((o) => {
+                        const active = sort === o.value
 
                         return (
                           <button
-                            key={String(f.value)}
+                            key={o.value}
                             onClick={() => {
-                              setFilter(f.value)
+                              setSort(o.value)
 
                               setFilterOpen(false)
                             }}
@@ -8230,10 +9492,8 @@ export default function App() {
                                 gap: 8,
                               }}
                             >
-                              {f.value !== "all" && (
-                                <CategoryIcon cat={String(f.value)} size={13} />
-                              )}
-                              {f.label}
+                              <o.Icon size={13} />
+                              {o.label}
                             </span>
                             {active && (
                               <span
@@ -8256,95 +9516,94 @@ export default function App() {
                 </div>
 
                 {/* View toggle */}
-                <div
-                  style={{
-                    display: "flex",
+                {!isNarrow && !archiveView && (
+                  <div
+                    style={{
+                      display: "flex",
 
-                    gap: 2,
+                      gap: 2,
 
-                    flexShrink: 0,
+                      flexShrink: 0,
 
-                    marginLeft: 0,
+                      marginLeft: 0,
 
-                    background: "var(--surface)",
+                      background: "var(--surface)",
 
-                    border: "1px solid var(--border)",
+                      border: "1px solid var(--border)",
 
-                    borderRadius: 9,
+                      borderRadius: 9,
 
-                    padding: 2,
-                  }}
-                >
-                  {([
-                    { value: "list", label: "List" },
+                      padding: 2,
+                    }}
+                  >
+                    {([
+                      { value: "list", label: "List" },
 
-                    { value: "grid", label: "Grid" },
-                  ] as const).map((opt) => {
-                    const active = view === opt.value
+                      { value: "grid", label: "Grid" },
+                    ] as const).map((opt) => {
+                      const active = effectiveView === opt.value
 
-                    return (
-                      <button
-                        key={opt.value}
-                        onClick={() => setView(opt.value)}
-                        title={`${opt.value} view`}
-                        style={{
-                          display: "flex",
+                      return (
+                        <button
+                          key={opt.value}
+                          onClick={() => {
+                            setView(opt.value)
 
-                          alignItems: "center",
+                            setViewTouched(true)
+                          }}
+                          title={`${opt.value} view`}
+                          style={{
+                            display: "flex",
 
-                          justifyContent: "center",
+                            alignItems: "center",
 
-                          gap: 5,
+                            justifyContent: "center",
 
-                          background: active
-                            ? "var(--primary-soft-bg)"
-                            : "transparent",
+                            gap: 5,
 
-                          color: active
-                            ? "var(--primary)"
-                            : "var(--text-muted)",
+                            background: active
+                              ? "var(--primary-soft-bg)"
+                              : "transparent",
 
-                          border: "none",
+                            color: active
+                              ? "var(--primary)"
+                              : "var(--text-muted)",
 
-                          borderRadius: 7,
+                            border: "none",
 
-                          padding: "5px 8px",
+                            borderRadius: 7,
 
-                          fontFamily: "Satoshi, sans-serif",
+                            padding: "5px 8px",
 
-                          fontWeight: 800,
+                            fontFamily: "Satoshi, sans-serif",
 
-                          fontSize: 12,
+                            fontWeight: 800,
 
-                          cursor: "pointer",
+                            fontSize: 12,
 
-                          transition: "all 0.15s",
-                        }}
-                      >
-                        {opt.value === "list" ? (
-                          <ListIcon size={15} />
-                        ) : (
-                          <GridIcon size={15} />
-                        )}
-                      </button>
-                    )
-                  })}
-                </div>
+                            cursor: "pointer",
+
+                            transition: "all 0.15s",
+                          }}
+                        >
+                          {opt.value === "list" ? (
+                            <ListIcon size={15} />
+                          ) : (
+                            <GridIcon size={15} />
+                          )}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
             )}
           </div>
         </div>
         <div
-          className="tide-line"
+          className="filter-line"
           style={{
-            height: 2,
-
-            background:
-              "linear-gradient(90deg, var(--primary), var(--accent), var(--primary))",
-
-            backgroundSize: "200% 100%",
-
-            opacity: 0.5,
+            height: 3,
           }}
         />
       </div>
@@ -8401,96 +9660,7 @@ export default function App() {
           </p>
         )}
 
-        {archiveView && (
-          <div
-            style={{
-              display: "flex",
-
-              flexWrap: "wrap",
-
-              gap: 8,
-
-              marginBottom: 12,
-            }}
-          >
-            {(() => {
-              const totalVotes = archiveClosed.reduce(
-                (s, p) => s + p.votes.reduce((a, v) => a + v, 0),
-                0,
-              )
-
-              const top = [...archiveClosed].sort(
-                (a, b) =>
-                  b.votes.reduce((s, v) => s + v, 0) -
-                  a.votes.reduce((s, v) => s + v, 0),
-              )[0]
-
-              const chip = (
-                icon: ReactNode,
-                label: string,
-                sub: string,
-                maxW: number,
-              ) => (
-                <span
-                  style={{
-                    display: "flex",
-
-                    alignItems: "center",
-
-                    gap: 7,
-
-                    background: "var(--surface)",
-
-                    border: "1px solid var(--border)",
-
-                    borderRadius: 99,
-
-                    padding: "6px 12px",
-
-                    fontSize: 12,
-
-                    fontWeight: 800,
-
-                    color: "var(--text-dim)",
-
-                    maxWidth: maxW,
-
-                    whiteSpace: "nowrap",
-
-                    overflow: "hidden",
-
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  <span
-                    style={{
-                      display: "flex",
-
-                      alignItems: "center",
-
-                      color: "var(--text-muted)",
-                    }}
-                  >
-                    {icon}
-                  </span>
-                  <span>
-                    {label}{" "}
-                    <span style={{ color: "var(--text-muted)" }}>{sub}</span>
-                  </span>
-                </span>
-              )
-
-              return (
-                <>
-                  {chip(<ArchiveIcon size={14} />, `${archiveClosed.length}`, "closed polls", 200)}
-                  {chip(<BallotIcon size={14} />, `${totalVotes}`, "votes cast", 180)}
-                  {top &&
-                    chip(<TrophyIcon size={14} />, top.question, `${top.votes.reduce((s, v) => s + v, 0)} votes`, 240)}
-                </>
-              )
-            })()}
-          </div>
-        )}
+        {archiveView && <div style={{ height: 12 }} />}
 
         {loading && sorted.length === 0 ? (
           <div
@@ -8555,7 +9725,7 @@ export default function App() {
               }}
             >
               {archiveView
-                ? "Nothing archived yet"
+                ? "No results yet"
                 : showMine
                   ? "No polls yet"
                   : "Nothing here"}
@@ -8564,14 +9734,14 @@ export default function App() {
               style={{
                 fontSize: 13,
 
-                margin: "0 0 18px",
+                margin: "0 0 22px",
 
                 fontWeight: 600,
               }}
             >
               {archiveView
                 ? search
-                  ? "No closed polls match that search."
+                  ? "No results match that search."
                   : "Polls stay live for a while — when they close, results land here."
                 : showMine
                   ? "Polls you post will show up here."
@@ -8611,13 +9781,19 @@ export default function App() {
         ) : (
           <div
             style={
-              view === "grid"
+              gridView
                 ? {
                     // Pure CSS masonry via multi-column flow: cards pack to
+
                     // their own content height (height: auto) with no row
-                    // stretching and no JS column-height measurement. Columns
-                    // auto-fit the container width like the old grid did.
-                    columnWidth: isNarrow ? 168 : 300,
+
+                    // stretching and no JS column-height measurement. On
+
+                    // desktop exactly two masonry columns fill the container,
+
+                    // so two poll tiles sit side by side in each "row".
+
+                    columnCount: isNarrow ? 3 : 2,
 
                     columnGap: isNarrow ? 12 : 14,
 
@@ -8651,8 +9827,7 @@ export default function App() {
 
                     width: "100%",
 
-                    marginBottom:
-                      view === "grid" ? (isNarrow ? 12 : 14) : 0,
+                    marginBottom: gridView ? (isNarrow ? 12 : 14) : 0,
                   }}
                 >
                   <PollCard
@@ -8665,7 +9840,7 @@ export default function App() {
                     onReplyComment={handleReplyComment}
                     onShare={handleShare}
                     openComments={poll.id === openCommentsId}
-                    compact={view === "grid" && isNarrow}
+                    compact={false}
                     isAdmin={isAdmin}
                     animateEnter={isNew}
                     enterDelay={Math.min(i, 4) * 40}
@@ -8897,6 +10072,13 @@ export default function App() {
         />
       )}
       {showRules && <RulesModal onClose={() => setShowRules(false)} />}
+      {showTheme && (
+        <ThemeModal
+          theme={theme}
+          onTheme={setTheme}
+          onClose={() => setShowTheme(false)}
+        />
+      )}
       {welcomeOpen && (
         <WelcomeModal
           onClose={() => {
@@ -9108,7 +10290,7 @@ export default function App() {
                     cursor: "pointer",
                   }}
                 >
-                  <ArchiveIcon size={15} /> Archive instead
+                  <ArchiveIcon size={15} /> Close instead
                 </button>
               )}
               <button
