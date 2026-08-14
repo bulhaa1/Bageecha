@@ -3791,7 +3791,7 @@ function SharedPollView({
     total > 0 ? Math.round((votes[i] / total) * 100) : 0
 
   const castVote = (i: number) => {
-    if (voted !== null) return
+    if (voted !== null || poll.expired) return
 
     onVote(i)
   }
@@ -3817,7 +3817,7 @@ function SharedPollView({
   }
 
   const stageOrVote = (i: number, e: React.MouseEvent<HTMLButtonElement>) => {
-    if (voted !== null) return
+    if (voted !== null || poll.expired) return
 
     popRipple(i, e)
 
@@ -4028,6 +4028,30 @@ function SharedPollView({
                   </span>
                 )
               })}
+              {poll.expired && (
+                <span
+                  className="tag-pill"
+                  style={{
+                    background: "var(--accent-soft-bg)",
+
+                    color: "var(--accent)",
+
+                    padding: "3px 10px",
+
+                    borderRadius: 99,
+
+                    border: "1px solid var(--accent-soft)",
+
+                    display: "inline-flex",
+
+                    alignItems: "center",
+
+                    gap: 5,
+                  }}
+                >
+                  <FlagIcon size={13} /> Closed
+                </span>
+              )}
               <span
                 style={{
                   display: "inline-flex",
@@ -4103,7 +4127,7 @@ function SharedPollView({
 
                 const isVoted = voted === i
 
-                const didVote = voted !== null
+                const didVote = voted !== null || poll.expired
 
                 const barColor = "var(--primary)"
 
@@ -4317,9 +4341,13 @@ function SharedPollView({
                   fontWeight: 700,
                 }}
               >
-                {voted !== null
-                  ? "Thanks for voting! 💛"
-                  : `${total.toLocaleString()} votes`}
+                {poll.expired
+                  ? `Ended ${formatPollEnd(
+                      poll.createdAt + pollLifetimeMs(poll),
+                    )} · ${total.toLocaleString()} votes`
+                  : voted !== null
+                    ? "Thanks for voting! 💛"
+                    : `${total.toLocaleString()} votes`}
               </span>
             </div>
           </div>
@@ -7975,6 +8003,8 @@ export default function App() {
 
     const id = shareCode
 
+    if (sharedPoll?.expired) return
+
     if (votePendingRef.current.has(id)) return
 
     if (profile[id]?.voted !== undefined && profile[id]?.voted !== null) return
@@ -8452,8 +8482,8 @@ export default function App() {
   if (sharedMissing) {
     return (
       <SharedStatusView
-        message="Poll not found"
-        sub="This poll may have been removed or expired."
+        message="This poll was deleted"
+        sub="It was removed by the creator or an admin."
         onHome={exitShared}
       />
     )
