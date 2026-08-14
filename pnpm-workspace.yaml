@@ -1,0 +1,7 @@
+allowBuilds:
+  '@firebase/util': true
+  protobufjs: true
+onlyBuiltDependencies:
+  - '@firebase/util'
+  - protobufjs
+verify-deps-before-run: false

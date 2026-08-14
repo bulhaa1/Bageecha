@@ -320,6 +320,35 @@ const MAX_TAGS = 3
 
 const TAG_MAX_LEN = 20
 
+// Curated common tags for autocomplete, offered even when no poll or preset
+// category has used them yet. Normalized/deduped against the pool at build time.
+const GENERAL_TAGS = [
+  "memes",
+  "news",
+  "gaming",
+  "movies",
+  "tv",
+  "anime",
+  "music",
+  "travel",
+  "food",
+  "sports",
+  "crypto",
+  "ai",
+  "tech",
+  "fitness",
+  "health",
+  "science",
+  "space",
+  "history",
+  "school",
+  "work",
+  "money",
+  "relationships",
+  "fashion",
+  "life",
+]
+
 const titleCase = (s: string) =>
   s ? s.charAt(0).toUpperCase() + s.slice(1) : s
 
@@ -3655,16 +3684,12 @@ function SharedPollView({
   onHome,
 
   onVote,
-
-  onComment,
 }: {
   poll: Poll
 
   onHome: () => void
 
   onVote: (option: number) => void
-
-  onComment: () => void
 }) {
   // Votes and the user's choice are derived from the parent's state (the
 
@@ -4222,30 +4247,6 @@ function SharedPollView({
                   ? "Thanks for voting! 💛"
                   : `${total.toLocaleString()} votes`}
               </span>
-              <button
-                onClick={onComment}
-                style={{
-                  marginLeft: "auto",
-
-                  background: "none",
-
-                  border: "none",
-
-                  cursor: "pointer",
-
-                  color: "var(--purple)",
-
-                  fontSize: 12,
-
-                  fontWeight: 800,
-
-                  fontFamily: "Satoshi, sans-serif",
-
-                  padding: "2px 0",
-                }}
-              >
-                <ChatIcon size={13} /> comment on this
-              </button>
             </div>
           </div>
         </div>
@@ -5504,12 +5505,16 @@ function NewPollModal({
   onClose,
 
   onSubmit,
+
+  existingTags,
 }: {
   onClose: () => void
 
   onSubmit: (
     p: Omit<Poll, "id" | "votes" | "voted" | "comments" | "timeAgo" | "hot" | "createdAt" | "upvotes" | "downvotes" | "userVote">,
   ) => void
+
+  existingTags: string[]
 }) {
   const isNarrow = useIsNarrow()
 
@@ -5526,6 +5531,8 @@ function NewPollModal({
   const [tags, setTags] = useState<string[]>([])
 
   const [tagInput, setTagInput] = useState("")
+
+  const [tagFocused, setTagFocused] = useState(false)
 
   const [durationH, setDurationH] = useState(24)
 
@@ -5561,6 +5568,48 @@ function NewPollModal({
 
   const removeTag = (t: string) =>
     setTags((prev) => prev.filter((x) => x !== t))
+
+  // Autocomplete for custom tags seen on existing polls (preset category chips
+  // are already shown in full below the input). Only STARTING-word (prefix)
+  // matches qualify so "ga" completes gaming but "in" does not; shown only
+  // while the user is typing.
+  const tagSuggestions = useMemo(() => {
+    const preset = new Set(Object.keys(CATEGORY_META).map(normalizeTag))
+    const q = tagInput.toLowerCase()
+    if (q === "") return []
+    return existingTags
+      .filter(
+        (t) =>
+          !preset.has(t) &&
+          !tags.includes(t) &&
+          t !== q &&
+          t.startsWith(q),
+      )
+      .sort((a, b) => a.localeCompare(b))
+      .slice(0, 6)
+  }, [existingTags, tags, tagInput])
+
+  // Pool for inline ghost completion: preset category keys first (so the box
+  // suggests what the highlighted chip below shows), then custom tags.
+  const allTagPool = useMemo(() => {
+    const presets = Object.keys(CATEGORY_META).map(normalizeTag)
+    return [...presets, ...existingTags.filter((t) => !presets.includes(t))]
+  }, [existingTags])
+
+  // Best prefix match for the ghost text inside the input. First Enter commits
+  // it into the box, a second Enter adds the tag.
+  const q = tagInput.toLowerCase()
+
+  const ghostMatch = useMemo(() => {
+    if (q === "" || tags.length >= MAX_TAGS) return null
+    return (
+      allTagPool.find(
+        (t) => t !== q && !tags.includes(t) && t.startsWith(q),
+      ) ?? null
+    )
+  }, [allTagPool, q, tags])
+
+  const ghostSuffix = ghostMatch ? ghostMatch.slice(q.length) : ""
 
   const valid =
     question.trim() !== "" &&
@@ -5676,7 +5725,7 @@ function NewPollModal({
                 marginBottom: 7,
               }}
             >
-              Your name
+              magey namakee
             </label>
             <div style={{ display: "flex", gap: 8 }}>
               <input
@@ -6084,51 +6133,90 @@ function NewPollModal({
                 })}
               </div>
             )}
-            <input
-              value={tagInput}
-              onChange={(e) =>
-                setTagInput(e.target.value.replace(/\s+/g, ""))
-              }
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault()
-
-                  addTag(tagInput)
+            <div style={{ position: "relative" }}>
+              {tagFocused && ghostMatch && (
+                <div
+                  aria-hidden
+                  style={{
+                    position: "absolute",
+                    top: 1,
+                    left: 1,
+                    right: 1,
+                    bottom: 1,
+                    padding: "8px 11px",
+                    fontSize: isNarrow ? 16 : 13,
+                    fontFamily: "Satoshi, sans-serif",
+                    lineHeight: "1.4",
+                    whiteSpace: "pre",
+                    overflow: "hidden",
+                    pointerEvents: "none",
+                    color: "transparent",
+                  }}
+                >
+                  {tagInput}
+                  <span style={{ color: "var(--text-faint)" }}>
+                    {ghostSuffix}
+                  </span>
+                </div>
+              )}
+              <input
+                value={tagInput}
+                onChange={(e) =>
+                  setTagInput(e.target.value.replace(/\s+/g, ""))
                 }
+                onFocus={() => setTagFocused(true)}
+                onBlur={() => setTagFocused(false)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault()
 
-                if (
-                  e.key === "Backspace" &&
-                  tagInput === "" &&
-                  tags.length > 0
-                ) {
-                  removeTag(tags[tags.length - 1])
+                    // First Enter commits the inline ghost completion into the
+                    // box; a second Enter adds the tag.
+                    if (ghostMatch && ghostMatch !== tagInput) {
+                      setTagInput(ghostMatch)
+
+                      return
+                    }
+
+                    addTag(tagInput)
+                  }
+
+                  if (
+                    e.key === "Backspace" &&
+                    tagInput === "" &&
+                    tags.length > 0
+                  ) {
+                    removeTag(tags[tags.length - 1])
+                  }
+                }}
+                disabled={tags.length >= MAX_TAGS}
+                placeholder={
+                  tags.length >= MAX_TAGS
+                    ? "Tag limit reached"
+                    : "Add a tag… (e.g. gaming, memeology)"
                 }
-              }}
-              disabled={tags.length >= MAX_TAGS}
-              placeholder={
-                tags.length >= MAX_TAGS
-                  ? "Tag limit reached"
-                  : "Add a tag… (e.g. gaming, memeology)"
-              }
-              maxLength={TAG_MAX_LEN}
-              style={{
-                width: "100%",
+                maxLength={TAG_MAX_LEN}
+                style={{
+                  width: "100%",
 
-                background: "var(--bg)",
+                  background: "transparent",
 
-                border: "1px solid var(--border)",
+                  border: "1px solid var(--border)",
 
-                borderRadius: 9,
+                  borderRadius: 9,
 
-                padding: "8px 11px",
+                  padding: "8px 11px",
 
-                color: "var(--text)",
+                  color: "var(--text)",
 
-                fontSize: isNarrow ? 16 : 13,
+                  fontSize: isNarrow ? 16 : 13,
 
-                fontFamily: "Satoshi, sans-serif",
-              }}
-            />
+                  fontFamily: "Satoshi, sans-serif",
+
+                  lineHeight: "1.4",
+                }}
+              />
+            </div>
             <div
               style={{
                 display: "flex",
@@ -6141,6 +6229,11 @@ function NewPollModal({
                 const used =
                   tags.includes(normalizeTag(cat)) || tags.length >= MAX_TAGS
 
+                const matching =
+                  !used && q !== "" && normalizeTag(cat).startsWith(q)
+
+                const m = categoryMeta(cat)
+
                 return (
                   <button
                     key={cat}
@@ -6148,9 +6241,13 @@ function NewPollModal({
                     disabled={used}
                     className="tag-pill"
                     style={{
-                      background: "transparent",
+                      background: matching ? m.bg : "transparent",
 
-                      color: used ? "var(--text-faint)" : "var(--text-faint)",
+                      color: matching
+                        ? m.text
+                        : used
+                          ? "var(--text-faint)"
+                          : "var(--text-faint)",
 
                       padding: "4px 11px",
 
@@ -6158,13 +6255,19 @@ function NewPollModal({
 
                       border: used
                         ? "1px dashed var(--border-strong)"
-                        : "1px solid var(--border)",
+                        : matching
+                          ? `1px solid ${m.border}`
+                          : "1px solid var(--border)",
+
+                      boxShadow: matching
+                        ? `0 0 0 3px ${m.border}, 0 0 12px ${m.bg}`
+                        : undefined,
 
                       cursor: used ? "default" : "pointer",
 
                       transition: "all 0.15s",
 
-                      opacity: used ? 0.45 : 1,
+                      opacity: used ? 0.45 : matching ? 1 : 0.9,
                     }}
                   >
                     <span
@@ -6183,6 +6286,38 @@ function NewPollModal({
                 )
               })}
             </div>
+            {tagSuggestions.length > 0 && (
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 5,
+                  marginTop: 8,
+                }}
+              >
+                {tagSuggestions.map((t) => {
+                  const m = categoryMeta(t)
+                  return (
+                    <button
+                      key={t}
+                      onClick={() => addTag(t)}
+                      className="tag-pill"
+                      style={{
+                        background: m.bg,
+                        color: m.text,
+                        padding: "4px 11px",
+                        borderRadius: 99,
+                        border: `1px solid ${m.border}`,
+                        cursor: "pointer",
+                        transition: "all 0.15s",
+                      }}
+                    >
+                      {titleCase(t)}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
           </div>
 
           <div>
@@ -6447,13 +6582,13 @@ export default function App() {
 
       options: data.options ?? [],
 
-      votes: (data.options ?? []).map((_, i) => data.votes?.[i] ?? 0),
+      votes: (data.options ?? []).map((_, i) => Number(data.votes?.[i]) || 0),
 
       voted: null,
 
-      upvotes: data.upvotes ?? 0,
+      upvotes: Math.max(0, Number(data.upvotes) || 0),
 
-      downvotes: data.downvotes ?? 0,
+      downvotes: Math.max(0, Number(data.downvotes) || 0),
 
       userVote: null,
 
@@ -6461,11 +6596,11 @@ export default function App() {
 
       timeAgo: "shared just now",
 
-      hot: data.hot ?? false,
+      hot: data.hot === true,
 
-      createdAt: data.createdAt ?? Date.now(),
+      createdAt: Number(data.createdAt) || Date.now(),
 
-      durationH: data.durationH ?? 48,
+      durationH: Math.min(48, Math.max(1, Number(data.durationH) || 48)),
     }
   })
 
@@ -6629,6 +6764,23 @@ export default function App() {
 
     [archivePolls],
   )
+
+  // Autocomplete pool for the create-poll tag field: preset category keys, a
+  // curated list of common general tags, plus custom tags already used on live
+  // (non-expired, non-archived) polls. Closed polls and the results archive are
+  // excluded so suggestions stay fresh and reduce duplication.
+  const tagSuggestions = useMemo(() => {
+    const seen = new Set<string>()
+    for (const p of polls) {
+      if (p.expired || p.archived) continue
+      for (const t of p.tags) {
+        if (t) seen.add(t)
+      }
+    }
+    for (const k of Object.keys(CATEGORY_META)) seen.add(normalizeTag(k))
+    for (const t of GENERAL_TAGS) seen.add(normalizeTag(t))
+    return [...seen].filter((t) => t !== "").sort()
+  }, [polls])
 
   const filters = useMemo(() => {
     // Rank tags by how many polls use them so junk/one-off tags can't crowd
@@ -7537,6 +7689,26 @@ export default function App() {
         console.error("Comment like write failed", err)
 
         likePendingRef.current.delete(likeKey)
+
+        // Roll back the optimistic like so the UI can't stay out of sync
+        // with the server when the write is rejected (e.g. offline).
+        patchRaw(pollId, (p) => {
+          const comments = { ...p.comments }
+
+          const cc = comments[commentId]
+
+          if (!cc) return p
+
+          comments[commentId] = {
+            ...cc,
+            likes: Math.max(0, cc.likes + (liked ? 1 : -1)),
+            likedBy: liked
+              ? [...(cc.likedBy ?? []), anonId]
+              : (cc.likedBy ?? []).filter((x) => x !== anonId),
+          }
+
+          return { ...p, comments }
+        })
       },
     )
   }
@@ -7684,48 +7856,6 @@ export default function App() {
     url.searchParams.delete("share")
 
     window.history.replaceState({}, "", url.toString())
-  }
-
-  const handleSharedComment = () => {
-    if (!sharedPoll) return
-
-    const targetId = `shared_${Date.now()}`
-
-    const feedPoll: Poll = {
-      ...sharedPoll,
-
-      id: targetId,
-
-      userVote: null,
-
-      voted: null,
-
-      comments: [],
-    }
-
-    setRawPolls((prev) => [toRawPoll(feedPoll, anonId), ...prev])
-
-    setDoc(doc(db, "polls", targetId), toRawPoll(feedPoll, anonId)).catch(
-      (err) => {
-        console.error("Shared poll save failed", err)
-
-        // Roll back the optimistic insert so no phantom poll lingers.
-
-        setRawPolls((prev) => prev.filter((p) => p.id !== targetId))
-
-        showToast("Couldn't save the poll — try again", 3500)
-
-        return
-      },
-    )
-
-    exitShared()
-
-    // Open the comment box only after exiting the shared view, otherwise
-
-    // exitShared's own clear would close it again in the same render.
-
-    setOpenCommentsId(targetId)
   }
 
   // Cursor-based pagination: fetch the next page of older polls (by
@@ -8117,7 +8247,6 @@ export default function App() {
         poll={sharedPoll}
         onHome={exitShared}
         onVote={handleSharedVote}
-        onComment={handleSharedComment}
       />
     )
   }
@@ -8692,222 +8821,278 @@ export default function App() {
             }}
           >
             {archiveView ? (
-              <>
+              isNarrow ? (
+                <>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginBottom: 8,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 13,
+                        fontWeight: 800,
+                        color: "var(--accent)",
+                        letterSpacing: "0.04em",
+                        textTransform: "uppercase",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                      }}
+                    >
+                      <ArchiveIcon size={16} /> Results
+                    </span>
+                    <button
+                      onClick={() => setShowArchive(false)}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 7,
+                        background: "none",
+                        border: "1px solid var(--border)",
+                        borderRadius: 9,
+                        padding: "6px 14px",
+                        color: "var(--text-dim)",
+                        fontFamily: "Satoshi, sans-serif",
+                        fontWeight: 800,
+                        fontSize: 12,
+                        cursor: "pointer",
+                        transition: "all 0.15s",
+                      }}
+                    >
+                      ← Back to feed
+                    </button>
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      flexWrap: "wrap",
+                      gap: 8,
+                      marginBottom: 12,
+                    }}
+                  >
+                    {(() => {
+                      const totalVotes = archiveClosed.reduce(
+                        (s, p) => s + p.votes.reduce((a, v) => a + v, 0),
+                        0,
+                      )
+                      return (
+                        <span
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            flexWrap: "wrap",
+                            gap: 8,
+                            fontSize: 12,
+                            fontWeight: 700,
+                            color: "var(--text-dim)",
+                          }}
+                        >
+                          {sorted.length} closed poll
+                          {sorted.length !== 1 ? "s" : ""}
+                          <span aria-hidden style={{ opacity: 0.5 }}>·</span>
+                          {totalVotes} votes cast
+                        </span>
+                      )
+                    })()}
+                    <div
+                      style={{
+                        display: "flex",
+                        background: "var(--surface)",
+                        border: "1px solid var(--border)",
+                        borderRadius: 9,
+                        padding: 2,
+                      }}
+                    >
+                      {([
+                        { value: "newest", label: "Newest", Icon: ClockIcon },
+                        {
+                          value: "mostVoted",
+                          label: "Most Voted",
+                          Icon: ChartIcon,
+                        },
+                      ] as const).map((opt) => {
+                        const active = archiveSort === opt.value
+                        return (
+                          <button
+                            key={opt.value}
+                            onClick={() => setArchiveSort(opt.value)}
+                            style={{
+                              background: active
+                                ? "var(--primary-soft-bg)"
+                                : "transparent",
+                              color: active
+                                ? "var(--primary)"
+                                : "var(--text-muted)",
+                              border: "none",
+                              borderRadius: 7,
+                              padding: "5px 9px",
+                              fontFamily: "Satoshi, sans-serif",
+                              fontWeight: 800,
+                              fontSize: 11.5,
+                              cursor: "pointer",
+                              transition: "all 0.15s",
+                              whiteSpace: "nowrap",
+                              flexShrink: 0,
+                            }}
+                          >
+                            <span
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 4,
+                              }}
+                            >
+                              <opt.Icon size={12} />
+                              {opt.label}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                </>
+              ) : (
                 <div
                   style={{
                     display: "flex",
-
                     alignItems: "center",
-
                     gap: 10,
-
                     marginBottom: 6,
-
                     flexWrap: "wrap",
                   }}
                 >
                   <span
                     style={{
                       fontSize: 11,
-
                       fontWeight: 900,
-
                       color: "var(--accent)",
-
                       letterSpacing: "0.08em",
-
                       textTransform: "uppercase",
-
                       display: "flex",
-
                       alignItems: "center",
-
                       gap: 6,
                     }}
                   >
                     <ArchiveIcon size={14} /> Results
                   </span>
-                  <span
-                    style={{
-                      fontSize: 12,
-
-                      fontWeight: 700,
-
-                      color: "var(--text-dim)",
-                    }}
-                  >
-                    {sorted.length} closed poll{sorted.length !== 1 ? "s" : ""}
-                  </span>
                   {archiveView &&
                     (() => {
                       const totalVotes = archiveClosed.reduce(
                         (s, p) => s + p.votes.reduce((a, v) => a + v, 0),
-
                         0,
                       )
-
                       return (
                         <span
                           style={{
                             display: "flex",
-
                             alignItems: "center",
-
                             flexWrap: "wrap",
-
-                            gap: 6,
-
+                            gap: 8,
                             fontSize: 12,
-
                             fontWeight: 700,
-
                             color: "var(--text-dim)",
                           }}
                         >
-                          <span aria-hidden>·</span>
+                          {sorted.length} closed poll
+                          {sorted.length !== 1 ? "s" : ""}
+                          <span aria-hidden style={{ opacity: 0.5 }}>·</span>
                           {totalVotes} votes cast
                         </span>
                       )
                     })()}
-                  <button
-                    onClick={() => setShowArchive(false)}
-                    style={{
-                      marginLeft: "auto",
-
-                      background: "none",
-
-                      border: "1px solid var(--border)",
-
-                      borderRadius: 9,
-
-                      padding: "6px 14px",
-
-                      color: "var(--text-dim)",
-
-                      fontFamily: "Satoshi, sans-serif",
-
-                      fontWeight: 800,
-
-                      fontSize: 12,
-
-                      cursor: "pointer",
-
-                      transition: "all 0.15s",
-                    }}
-                  >
-                    ← Back to feed
-                  </button>
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-
-                    alignItems: "center",
-
-                    gap: 8,
-
-                    marginBottom: isNarrow ? 4 : 6,
-
-                    flexWrap: isNarrow ? "nowrap" : "wrap",
-                  }}
-                >
-                  {!isNarrow && (
-                    <span
-                      style={{
-                        fontSize: 10,
-
-                        fontWeight: 700,
-
-                        color: "var(--text-faint)",
-
-                        letterSpacing: "0.08em",
-
-                        textTransform: "uppercase",
-                      }}
-                    >
-                      Sort by
-                    </span>
-                  )}
                   <div
                     style={{
+                      marginLeft: "auto",
                       display: "flex",
-
-                      background: "var(--surface)",
-
-                      border: "1px solid var(--border)",
-
-                      borderRadius: isNarrow ? 9 : 10,
-
-                      padding: isNarrow ? 2 : 3,
-
-                      maxWidth: isNarrow ? "100%" : "none",
-
-                      overflowX: isNarrow ? "auto" : "visible",
+                      alignItems: "center",
+                      gap: 8,
                     }}
                   >
-                    {([
-                      { value: "newest", label: "Newest", Icon: ClockIcon },
-
-                      {
-                        value: "mostVoted",
-                        label: "Most Voted",
-                        Icon: ChartIcon,
-                      },
-                    ] as const).map((opt) => {
-                      const active = archiveSort === opt.value
-
-                      return (
-                        <button
-                          key={opt.value}
-                          onClick={() => setArchiveSort(opt.value)}
-                          style={{
-                            background: active
-                              ? "var(--primary-soft-bg)"
-                              : "transparent",
-
-                            color: active
-                              ? "var(--primary)"
-                              : "var(--text-muted)",
-
-                            border: "none",
-
-                            borderRadius: isNarrow ? 7 : 8,
-
-                            padding: isNarrow ? "5px 9px" : "6px 11px",
-
-                            fontFamily: "Satoshi, sans-serif",
-
-                            fontWeight: 800,
-
-                            fontSize: isNarrow ? 11.5 : 12,
-
-                            cursor: "pointer",
-
-                            transition: "all 0.15s",
-
-                            whiteSpace: "nowrap",
-
-                            flexShrink: 0,
-                          }}
-                        >
-                          <span
+                    <button
+                      onClick={() => setShowArchive(false)}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "flex-start",
+                        gap: 7,
+                        background: "none",
+                        border: "1px solid var(--border)",
+                        borderRadius: 9,
+                        padding: "6px 14px",
+                        color: "var(--text-dim)",
+                        fontFamily: "Satoshi, sans-serif",
+                        fontWeight: 800,
+                        fontSize: 12,
+                        cursor: "pointer",
+                        transition: "all 0.15s",
+                      }}
+                    >
+                      ← Back to feed
+                    </button>
+                    <div
+                      style={{
+                        display: "flex",
+                        background: "var(--surface)",
+                        border: "1px solid var(--border)",
+                        borderRadius: 10,
+                        padding: 3,
+                      }}
+                    >
+                      {([
+                        { value: "newest", label: "Newest", Icon: ClockIcon },
+                        {
+                          value: "mostVoted",
+                          label: "Most Voted",
+                          Icon: ChartIcon,
+                        },
+                      ] as const).map((opt) => {
+                        const active = archiveSort === opt.value
+                        return (
+                          <button
+                            key={opt.value}
+                            onClick={() => setArchiveSort(opt.value)}
                             style={{
-                              display: "flex",
-
-                              alignItems: "center",
-
-                              gap: isNarrow ? 4 : 5,
+                              background: active
+                                ? "var(--primary-soft-bg)"
+                                : "transparent",
+                              color: active
+                                ? "var(--primary)"
+                                : "var(--text-muted)",
+                              border: "none",
+                              borderRadius: 8,
+                              padding: "6px 11px",
+                              fontFamily: "Satoshi, sans-serif",
+                              fontWeight: 800,
+                              fontSize: 12,
+                              cursor: "pointer",
+                              transition: "all 0.15s",
+                              whiteSpace: "nowrap",
+                              flexShrink: 0,
                             }}
                           >
-                            <opt.Icon size={isNarrow ? 12 : 13} />
-                            {opt.label}
-                          </span>
-                        </button>
-                      )
-                    })}
+                            <span
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 5,
+                              }}
+                            >
+                              <opt.Icon size={13} />
+                              {opt.label}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
                   </div>
                 </div>
-              </>
+              )
             ) : (
               <div
                 style={{
@@ -10069,6 +10254,7 @@ export default function App() {
         <NewPollModal
           onClose={() => setShowModal(false)}
           onSubmit={handleNewPoll}
+          existingTags={tagSuggestions}
         />
       )}
       {showRules && <RulesModal onClose={() => setShowRules(false)} />}
