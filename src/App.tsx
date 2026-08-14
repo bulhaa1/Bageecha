@@ -124,44 +124,6 @@ const playDownvoteSound = () => {
   setTimeout(() => playTone(246.94, 0.12, "sine", 0.15), 60)
 }
 
-const encodeShare = (poll: Poll) => {
-  const data = {
-    question: poll.question,
-
-    description: poll.description,
-
-    category: poll.category,
-
-    tags: poll.tags,
-
-    author: poll.author,
-
-    options: poll.options,
-
-    votes: poll.votes,
-
-    upvotes: poll.upvotes,
-
-    downvotes: poll.downvotes,
-
-    hot: poll.hot,
-
-    createdAt: poll.createdAt,
-
-    durationH: poll.durationH,
-  }
-
-  const json = JSON.stringify(data)
-
-  return btoa(unescape(encodeURIComponent(json)))
-
-    .replace(/\+/g, "-")
-
-    .replace(/\//g, "_")
-
-    .replace(/=+$/, "")
-}
-
 const decodeShare = (s: string): Partial<Poll> | null => {
   try {
     const b64 = s.replace(/-/g, "+").replace(/_/g, "/")
@@ -186,7 +148,7 @@ const decodeShare = (s: string): Partial<Poll> | null => {
 }
 
 const buildShareUrl = (poll: Poll) =>
-  `${window.location.origin}${window.location.pathname}?share=${encodeShare(poll)}`
+  `${window.location.origin}${window.location.pathname}?share=${poll.id}`
 
 type Category = "Food" | "Transport" | "Lifestyle" | "Hot Take" | "Community" | "Sports" | "Politics" | "Tech" | "Music" | "Dating" | "Environment" | "Fashion" | "General" | "Controversial"
 
@@ -3678,6 +3640,118 @@ function PollCard({
   )
 }
 
+function SharedStatusView({
+  message,
+  sub,
+  onHome,
+}: {
+  message: string
+  sub: string
+  onHome: () => void
+}) {
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "var(--bg)",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      <header
+        style={{
+          position: "sticky",
+          top: 0,
+          zIndex: 50,
+          background: "var(--bg-92)",
+          borderBottom: "1px solid var(--border)",
+        }}
+      >
+        <div
+          style={{
+            maxWidth: 620,
+            margin: "0 auto",
+            padding: "12px 16px",
+            display: "flex",
+            alignItems: "center",
+          }}
+        >
+          <button
+            onClick={onHome}
+            style={{
+              display: "flex",
+              alignItems: "baseline",
+              gap: 7,
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              padding: 0,
+            }}
+            title="Back to homepage"
+          >
+            <span
+              style={{
+                fontFamily: "Satoshi, sans-serif",
+                fontSize: 18,
+                fontWeight: 900,
+                color: "var(--text)",
+                letterSpacing: "0.04em",
+                textTransform: "uppercase",
+              }}
+            >
+              Bageecha
+            </span>
+            <IslandLogo size={16} />
+          </button>
+        </div>
+      </header>
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "32px 16px",
+          textAlign: "center",
+          color: "var(--text-faint)",
+        }}
+      >
+        <p
+          style={{
+            fontFamily: "Satoshi, sans-serif",
+            fontSize: 18,
+            fontWeight: 900,
+            color: "var(--text-dim)",
+            margin: "0 0 6px",
+          }}
+        >
+          {message}
+        </p>
+        <p style={{ fontSize: 13, fontWeight: 600, margin: "0 0 18px" }}>
+          {sub}
+        </p>
+        <button
+          onClick={onHome}
+          style={{
+            background: "var(--surface)",
+            border: "1px solid var(--border)",
+            borderRadius: 99,
+            padding: "8px 16px",
+            color: "var(--text-dim)",
+            fontFamily: "Satoshi, sans-serif",
+            fontWeight: 800,
+            fontSize: 12,
+            cursor: "pointer",
+          }}
+        >
+          ← Explore more
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function SharedPollView({
   poll,
 
@@ -6554,14 +6628,17 @@ export default function App() {
 
   const [showArchive, setShowArchive] = useState(false)
 
+  // Share links: `?share=<code>`. New links carry the poll's real Firestore
+  // id (short); legacy long links embed a base64 snapshot and are kept
+  // working via decodeShare below.
+  const [shareCode, setShareCode] = useState<string | null>(
+    () => new URLSearchParams(window.location.search).get("share"),
+  )
+
   const [sharedPoll, setSharedPoll] = useState<Poll | null>(() => {
-    const params = new URLSearchParams(window.location.search)
+    if (!shareCode) return null
 
-    const code = params.get("share")
-
-    if (!code) return null
-
-    const data = decodeShare(code)
+    const data = decodeShare(shareCode)
 
     if (!data) return null
 
@@ -6603,6 +6680,51 @@ export default function App() {
       durationH: Math.min(48, Math.max(1, Number(data.durationH) || 48)),
     }
   })
+
+  // A share code that isn't a legacy snapshot is a real poll id: subscribe to
+  // the live document so the shared view shows real, current data and votes
+  // made here land on the same doc the feed reads from.
+  const [sharedLoading, setSharedLoading] = useState(false)
+
+  const [sharedMissing, setSharedMissing] = useState(false)
+
+  useEffect(() => {
+    if (!shareCode || decodeShare(shareCode)) return
+
+    setSharedLoading(true)
+
+    const unsub = onSnapshot(
+      doc(db, "polls", shareCode),
+
+      (snap) => {
+        setSharedLoading(false)
+
+        if (!snap.exists()) {
+          setSharedMissing(true)
+
+          setSharedPoll(null)
+
+          return
+        }
+
+        setSharedMissing(false)
+
+        const raw = { ...(snap.data() as RawPoll), id: snap.id }
+
+        setSharedPoll(toViewPoll(raw, anonId, profile, Date.now()))
+      },
+
+      (err) => {
+        console.error("Shared poll sync failed", err)
+
+        setSharedLoading(false)
+
+        setSharedMissing(true)
+      },
+    )
+
+    return () => unsub()
+  }, [shareCode, anonId, profile])
 
   const [filter, setFilter] = useState<"all" | string>("all")
 
@@ -7835,19 +7957,95 @@ export default function App() {
   }
 
   const handleSharedVote = (option: number) => {
+    // Legacy long-format snapshot links embed no real poll id, so the vote
+    // only updates the local view (unchanged behavior).
+    if (!shareCode || decodeShare(shareCode)) {
+      setSharedPoll((prev) => {
+        if (!prev || prev.voted !== null) return prev
+
+        const votes = [...prev.votes]
+
+        votes[option] = (votes[option] ?? 0) + 1
+
+        return { ...prev, votes, voted: option }
+      })
+
+      return
+    }
+
+    const id = shareCode
+
+    if (votePendingRef.current.has(id)) return
+
+    if (profile[id]?.voted !== undefined && profile[id]?.voted !== null) return
+
+    const raw = allRawPolls.find((p) => p.id === id)
+
+    if (raw && Date.now() - raw.createdAt > pollLifetimeMs(raw)) return
+
+    votePendingRef.current.add(id)
+
+    setProfile((prev) => ({ ...prev, [id]: { ...prev[id], voted: option } }))
+
     setSharedPoll((prev) => {
       if (!prev || prev.voted !== null) return prev
 
       const votes = [...prev.votes]
 
-      votes[option] += 1
+      votes[option] = (votes[option] ?? 0) + 1
 
       return { ...prev, votes, voted: option }
     })
+
+    runTransaction(db, async (tx) => {
+      const ref = doc(db, "polls", id)
+
+      const snap = await tx.get(ref)
+
+      if (!snap.exists()) return
+
+      const cur = normalizeVotes(snap.data() as RawPoll)
+
+      cur[option] = (cur[option] ?? 0) + 1
+
+      tx.update(ref, { votes: cur })
+    }).then(
+      () => votePendingRef.current.delete(id),
+
+      (err) => {
+        console.error("Shared vote write failed", err)
+
+        votePendingRef.current.delete(id)
+
+        setProfile((prev) => ({
+          ...prev,
+
+          [id]: { ...prev[id], voted: null },
+        }))
+
+        setSharedPoll((prev) => {
+          if (!prev) return prev
+
+          const votes = [...prev.votes]
+
+          votes[option] = Math.max(0, (votes[option] ?? 0) - 1)
+
+          return { ...prev, votes, voted: null }
+        })
+
+        showToast("Vote failed — please try again", 3000)
+      },
+    )
   }
 
   const exitShared = () => {
     setSharedPoll(null)
+
+    setShareCode(null)
+
+    setSharedLoading(false)
+
+    setSharedMissing(false)
 
     setOpenCommentsId(null)
 
@@ -8240,6 +8438,26 @@ export default function App() {
 
     return () => obs.disconnect()
   }, [sorted.length, archiveView])
+
+  if (sharedLoading) {
+    return (
+      <SharedStatusView
+        message="Loading poll…"
+        sub="Fetching the island chatter."
+        onHome={exitShared}
+      />
+    )
+  }
+
+  if (sharedMissing) {
+    return (
+      <SharedStatusView
+        message="Poll not found"
+        sub="This poll may have been removed or expired."
+        onHome={exitShared}
+      />
+    )
+  }
 
   if (sharedPoll) {
     return (
