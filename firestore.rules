@@ -37,6 +37,7 @@ service cloud.firestore {
         (!data.keys().hasAny(['downvotes']) || data.downvotes is int && data.downvotes >= 0 && data.downvotes <= 1000000) &&
         (!data.keys().hasAny(['hot']) || data.hot is bool) &&
         (!data.keys().hasAny(['creatorId']) || (data.creatorId is string && data.creatorId.size() > 0 && data.creatorId.size() <= 40)) &&
+        (!data.keys().hasAny(['creatorUid']) || (data.creatorUid is string && data.creatorUid.size() > 0 && data.creatorUid.size() <= 40)) &&
         (!data.keys().hasAny(['comments']) ||
           (data.comments is map && data.comments.size() <= 500 &&
            data.comments.values().all(c => c is map &&
@@ -126,7 +127,11 @@ service cloud.firestore {
       allow create: if isValidNewPoll(request.resource.data) &&
         !request.resource.data.archived;
       allow update: if isAdmin() || onlySafeFieldUpdates();
-      allow delete: if isAdmin();
+      allow delete: if isAdmin() ||
+        (request.auth != null &&
+         request.auth.uid == resource.data.creatorUid &&
+         !resource.data.archived &&
+         request.time.millis() - resource.data.createdAt < resource.data.durationH * 3600 * 1000);
     }
   }
 }

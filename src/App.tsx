@@ -32,6 +32,7 @@ import {
 
 import {
   onAuthStateChanged,
+  signInAnonymously,
   signInWithPopup,
   signInWithRedirect,
   getRedirectResult,
@@ -182,6 +183,8 @@ interface Poll {
   author: string
 
   creatorId?: string
+
+  creatorUid?: string
 
   options: string[]
 
@@ -523,6 +526,8 @@ const toRawPoll = (poll: Poll, anonId: string): RawPoll => ({
 
   creatorId: poll.creatorId ?? "",
 
+  creatorUid: poll.creatorUid ?? "",
+
   options: poll.options,
 
   votes: poll.votes,
@@ -609,6 +614,8 @@ const toViewPoll = (
     author: d.author,
 
     creatorId: d.creatorId,
+
+    creatorUid: d.creatorUid,
 
     options,
 
@@ -2439,7 +2446,11 @@ function PollCard({
 
   isAdmin = false,
 
+  isOwner = false,
+
   onDelete,
+
+  onExtend,
 
   animateEnter = false,
 
@@ -2473,7 +2484,11 @@ function PollCard({
 
   isAdmin?: boolean
 
+  isOwner?: boolean
+
   onDelete?: (id: string) => void
+
+  onExtend?: (id: string, minutes: number) => void
 
   animateEnter?: boolean
 
@@ -3275,7 +3290,7 @@ function PollCard({
             <LinkIcon size={14} /> Share
           </button>
         )}
-        {isAdmin && onDelete && (
+        {(isAdmin || (isOwner && !poll.expired)) && onDelete && (
           <button
             onClick={() => onDelete(poll.id)}
             title="Delete this poll for everyone"
@@ -3301,6 +3316,53 @@ function PollCard({
           >
             <TrashIcon size={14} /> Delete
           </button>
+        )}
+        {isAdmin && !poll.expired && onExtend && (
+          <select
+            defaultValue=""
+            onChange={(e) => {
+              const mins = Number(e.target.value)
+
+              if (mins > 0) onExtend(poll.id, mins)
+
+              e.target.value = ""
+            }}
+            title="Extend the voting deadline"
+            aria-label="Extend poll"
+            style={{
+              background: "none",
+
+              border: "1px solid var(--border)",
+
+              borderRadius: 99,
+
+              color: "var(--text-dim)",
+
+              fontSize: 12,
+
+              fontWeight: 800,
+
+              fontFamily: "Satoshi, sans-serif",
+
+              padding: isNarrow ? "8px 10px" : "3px 10px",
+
+              cursor: "pointer",
+            }}
+          >
+            <option value="" disabled>
+              Extend…
+            </option>
+
+            <option value={30}>+30 min</option>
+
+            <option value={60}>+1 hr</option>
+
+            <option value={180}>+3 hrs</option>
+
+            <option value={360}>+6 hrs</option>
+
+            <option value={720}>+12 hrs</option>
+          </select>
         )}
       </div>
 
@@ -6857,6 +6919,8 @@ export default function App() {
 
   const isAdmin = user?.email === ADMIN_EMAIL
 
+  const authUid = user?.uid
+
   const archiveView = showArchive
 
   const toastTimer = useRef(0)
@@ -7375,6 +7439,14 @@ export default function App() {
     const unsub = onAuthStateChanged(auth, (u) => setUser(u))
 
     return () => unsub()
+  }, [])
+
+  useEffect(() => {
+    if (auth.currentUser) return
+
+    signInAnonymously(auth).catch((err) => {
+      console.error("Anonymous sign-in failed", err)
+    })
   }, [])
 
   useEffect(() => {
@@ -8228,6 +8300,8 @@ export default function App() {
 
       creatorId: anonId,
 
+      creatorUid: auth.currentUser?.uid ?? "",
+
       votes: data.options.map(() => 0),
 
       voted: null,
@@ -8301,6 +8375,41 @@ export default function App() {
     updateDoc(doc(db, "polls", id), { archived: true }).catch((err) =>
       console.error("Archive poll failed", err),
     )
+  }
+
+  const handleExtendPoll = (id: string, minutes: number) => {
+    const extend = (prev: RawPoll[]) =>
+      prev.map((p) =>
+        p.id === id
+          ? {
+              ...p,
+              durationH: Math.round(((p.durationH ?? 48) + minutes / 60) * 10) / 10,
+            }
+          : p,
+      )
+
+    setRawPolls(extend)
+
+    setOlderPolls(extend)
+
+    setArchiveRawPolls(extend)
+
+    setOlderArchivePolls(extend)
+
+    const target = (
+      rawPolls.find((p) => p.id === id) ??
+      olderPolls.find((p) => p.id === id) ??
+      allArchiveRawPolls.find((p) => p.id === id) ??
+      olderArchivePolls.find((p) => p.id === id)
+    )
+
+    const newDurationH = Math.round(((target?.durationH ?? 48) + minutes / 60) * 10) / 10
+
+    updateDoc(doc(db, "polls", id), { durationH: newDurationH }).catch((err) =>
+      console.error("Extend poll failed", err),
+    )
+
+    showToast(`⏰ Extended by ${minutes}m`, 2200)
   }
 
   const handleAdminLogin = () => {
@@ -10275,6 +10384,7 @@ export default function App() {
                     openComments={poll.id === openCommentsId}
                     compact={false}
                     isAdmin={isAdmin}
+                    isOwner={!!authUid && poll.creatorUid === authUid}
                     animateEnter={isNew}
                     enterDelay={Math.min(i, 4) * 40}
                     openResults={archiveView}
@@ -10283,6 +10393,7 @@ export default function App() {
                     onDelete={(id) =>
                       setConfirmDelete(polls.find((p) => p.id === id) ?? null)
                     }
+                    onExtend={handleExtendPoll}
                   />
                 </div>
               )
