@@ -40,7 +40,9 @@ import {
   type User,
 } from "firebase/auth"
 
-import { db, auth, googleProvider, ADMIN_EMAIL } from "./firebase"
+import { db, auth, googleProvider, ADMIN_EMAIL, analytics } from "./firebase"
+
+import { logEvent } from "firebase/analytics"
 
 let audioCtx: AudioContext | null = null
 
@@ -7742,7 +7744,11 @@ export default function App() {
       // the emulator doesn't surface it in request.resource.data for rules.
       tx.update(ref, { votes: cur, voters: { ...(data.voters ?? {}), [uid]: option } })
     }).then(
-      () => votePendingRef.current.delete(id),
+      () => {
+        logEvent(analytics, "poll_voted", { poll_id: id, option })
+
+        votePendingRef.current.delete(id)
+      },
 
       (err) => {
         console.error("Vote write failed", err)
@@ -7807,7 +7813,11 @@ export default function App() {
 
     updateDoc(doc(db, "polls", pollId), { [`comments.${cid}`]: comment })
 
-      .then(() => commentPendingRef.current.delete(pollId))
+      .then(() => {
+        logEvent(analytics, "comment_added", { poll_id: pollId })
+
+        commentPendingRef.current.delete(pollId)
+      })
 
       .catch((err) => {
         console.error("Comment write failed", err)
@@ -8068,6 +8078,8 @@ export default function App() {
   }
 
   const handleShare = (poll: Poll) => {
+    logEvent(analytics, "poll_shared", { poll_id: poll.id })
+
     const url = buildShareUrl(poll)
 
     const copyLink = async () => {
@@ -8386,7 +8398,11 @@ export default function App() {
 
     setDoc(doc(db, "polls", newPoll.id), toRawPoll(newPoll, anonId))
 
-      .then(() => showToast("🌴 Posted!", 2000))
+      .then(() => {
+        logEvent(analytics, "poll_created")
+
+        showToast("🌴 Posted!", 2000)
+      })
 
       .catch((err) => {
         console.error("Post poll failed", err)

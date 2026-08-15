@@ -1,4 +1,5 @@
 import { initializeApp } from "firebase/app"
+import { getAnalytics } from "firebase/analytics"
 import { getFirestore } from "firebase/firestore"
 import { getAuth, GoogleAuthProvider } from "firebase/auth"
 
@@ -9,9 +10,11 @@ const firebaseConfig = {
   storageBucket: "bageecha-421c1.firebasestorage.app",
   messagingSenderId: "96231101172",
   appId: "1:96231101172:web:c4e2ec80625b1d625884a1",
+  measurementId: "G-E97MMMJZRL",
 }
 
 export const app = initializeApp(firebaseConfig)
+export const analytics = getAnalytics(app)
 export const db = getFirestore(app)
 export const auth = getAuth(app)
 export const googleProvider = new GoogleAuthProvider()
