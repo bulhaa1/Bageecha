@@ -3316,7 +3316,7 @@ function PollCard({
               transition: "color 0.15s",
             }}
           >
-            <TrashIcon size={14} /> Delete
+            <TrashIcon size={14} />
           </button>
         )}
         {isAdmin && !poll.expired && onExtend && (
@@ -10855,7 +10855,7 @@ export default function App() {
                 color: "var(--text)",
               }}
             >
-              What to do with this poll?
+              {isAdmin ? "What to do with this poll?" : "Delete this poll?"}
             </p>
             <p
               style={{
@@ -10870,12 +10870,30 @@ export default function App() {
             >
               "{confirmDelete.question}"
             </p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {!confirmDelete.expired && (
+            <div
+              style={{
+                display: "flex",
+
+                flexDirection: "column",
+
+                gap: 8,
+
+                alignItems: "stretch",
+              }}
+            >
+              {isAdmin && !confirmDelete.expired && (
                 <button
                   onClick={() => handleArchivePoll(confirmDelete.id)}
                   style={{
                     width: "100%",
+
+                    display: "flex",
+
+                    alignItems: "center",
+
+                    justifyContent: "center",
+
+                    gap: 6,
 
                     background: "var(--gradient)",
 
@@ -10904,7 +10922,15 @@ export default function App() {
                 style={{
                   width: "100%",
 
-                  background: "var(--accent)",
+                  display: "flex",
+
+                  alignItems: "center",
+
+                  justifyContent: "center",
+
+                  gap: 6,
+
+                  background: "#e5484d",
 
                   border: "none",
 
@@ -10929,6 +10955,14 @@ export default function App() {
                 onClick={() => setConfirmDelete(null)}
                 style={{
                   width: "100%",
+
+                  display: "flex",
+
+                  alignItems: "center",
+
+                  justifyContent: "center",
+
+                  gap: 6,
 
                   background: "var(--surface)",
 

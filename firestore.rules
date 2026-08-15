@@ -81,13 +81,12 @@ service cloud.firestore {
 
     function onlySafeFieldUpdates() {
       return changedKeys().hasOnly([
-        'votes', 'voters', 'upvotes', 'downvotes', 'comments', 'archived'
+        'votes', 'voters', 'upvotes', 'downvotes', 'comments'
       ]) &&
         (!changedKeys().hasAny(['votes']) || safeVotes()) &&
         (!changedKeys().hasAny(['upvotes']) || safeUpvotes()) &&
         (!changedKeys().hasAny(['downvotes']) || safeDownvotes()) &&
-        (!changedKeys().hasAny(['comments']) || safeComments()) &&
-        (!changedKeys().hasAny(['archived']) || request.resource.data.archived == true);
+        (!changedKeys().hasAny(['comments']) || safeComments());
     }
 
     match /polls/{pollId} {
