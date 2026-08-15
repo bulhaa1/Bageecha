@@ -65,7 +65,7 @@ service cloud.firestore {
         data.createdAt is number &&
         data.archived == false &&
         (!data.keys().hasAny(['description']) ||
-          (data.description is string && data.description.size() > 0 && data.description.size() <= 280)) &&
+          (data.description is string && data.description.size() <= 280)) &&
         (!data.keys().hasAny(['category']) ||
           (data.category is string && data.category.size() > 0 && data.category.size() <= 20)) &&
         (!data.keys().hasAny(['durationH']) ||
