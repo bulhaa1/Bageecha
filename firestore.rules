@@ -21,8 +21,15 @@ service cloud.firestore {
     }
 
     function safeVotes() {
-      return request.resource.data.votes is list &&
-        request.resource.data.votes.size() == resource.data.options.size();
+      return request.auth != null &&
+        request.resource.data.votes is list &&
+        request.resource.data.votes.size() == resource.data.options.size() &&
+        request.resource.data.voters is map &&
+        request.resource.data.voters[request.auth.uid] is int &&
+        request.resource.data.voters[request.auth.uid] >= 0 &&
+        request.resource.data.voters[request.auth.uid] < resource.data.options.size() &&
+        (!('voters' in resource.data) ||
+         !(request.auth.uid in resource.data.voters));
     }
 
     function safeUpvotes() {
@@ -74,7 +81,7 @@ service cloud.firestore {
 
     function onlySafeFieldUpdates() {
       return changedKeys().hasOnly([
-        'votes', 'upvotes', 'downvotes', 'comments', 'archived'
+        'votes', 'voters', 'upvotes', 'downvotes', 'comments', 'archived'
       ]) &&
         (!changedKeys().hasAny(['votes']) || safeVotes()) &&
         (!changedKeys().hasAny(['upvotes']) || safeUpvotes()) &&

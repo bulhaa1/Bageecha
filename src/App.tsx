@@ -235,6 +235,8 @@ type RawPoll = Omit<Poll, "voted" | "userVote" | "comments" | "tags"> & {
   tags?: string[]
 
   comments?: Record<string, RawComment>
+
+  voters?: Record<string, number>
 }
 
 type ProfileMap = Record<string, {
@@ -6921,6 +6923,28 @@ export default function App() {
 
   const authUid = user?.uid
 
+  // Shared in-flight anonymous sign-in so multiple call sites (mount effect,
+  // create poll, vote) await the same promise instead of racing a fresh one.
+  const anonSignInRef = useRef<Promise<User | null> | null>(null)
+
+  const ensureAnonAuth = (): Promise<User | null> => {
+    if (auth.currentUser) return Promise.resolve(auth.currentUser)
+
+    if (!anonSignInRef.current) {
+      anonSignInRef.current = signInAnonymously(auth)
+        .then((c) => c.user)
+        .catch((err) => {
+          console.error("Anonymous sign-in failed", err)
+
+          anonSignInRef.current = null
+
+          return null
+        })
+    }
+
+    return anonSignInRef.current
+  }
+
   const archiveView = showArchive
 
   const toastTimer = useRef(0)
@@ -7172,21 +7196,33 @@ export default function App() {
 
     if (!saved) return
 
-    try {
-      const parsed = JSON.parse(saved) as Poll[]
+    const migrate = async () => {
+      try {
+        const parsed = JSON.parse(saved) as Poll[]
 
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        parsed.forEach((p) =>
-          setDoc(doc(db, "polls", p.id), toRawPoll(p, anonId)).catch((err) =>
-            console.error("Migration write failed", err),
-          ),
-        )
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          await Promise.all(
+            parsed.map(async (p) => {
+              const ref = doc(db, "polls", p.id)
+
+              const existing = await getDoc(ref)
+
+              // Never overwrite a poll that already exists server-side —
+              // it may have newer votes/comments than this stale local copy.
+              if (existing.exists()) return
+
+              await setDoc(ref, toRawPoll(p, anonId))
+            }),
+          )
+        }
+      } catch (err) {
+        console.error("Migration failed", err)
       }
-    } catch {
-      /* ignore corrupt storage */
+
+      localStorage.removeItem("bageecha-my-polls")
     }
 
-    localStorage.removeItem("bageecha-my-polls")
+    migrate()
   }, [anonId])
 
   useEffect(() => {
@@ -7444,9 +7480,7 @@ export default function App() {
   useEffect(() => {
     if (auth.currentUser) return
 
-    signInAnonymously(auth).catch((err) => {
-      console.error("Anonymous sign-in failed", err)
-    })
+    ensureAnonAuth()
   }, [])
 
   useEffect(() => {
@@ -7651,7 +7685,7 @@ export default function App() {
     }
   }, [])
 
-  const handleVote = (id: string, option: number) => {
+  const handleVote = async (id: string, option: number) => {
     if (votePendingRef.current.has(id)) return
 
     if (profile[id]?.voted !== undefined && profile[id]?.voted !== null) return
@@ -7659,6 +7693,16 @@ export default function App() {
     const raw = allRawPolls.find((p) => p.id === id)
 
     if (raw && Date.now() - raw.createdAt > pollLifetimeMs(raw)) return
+
+    const user = await ensureAnonAuth()
+
+    if (!user?.uid) {
+      showToast("Vote failed — sign-in not ready, try again", 3000)
+
+      return
+    }
+
+    const uid = user.uid
 
     votePendingRef.current.add(id)
 
@@ -7683,11 +7727,20 @@ export default function App() {
 
       if (!snap.exists()) return
 
-      const cur = normalizeVotes(snap.data() as RawPoll)
+      const data = snap.data() as RawPoll
+
+      // Server-side single-vote guard: if this user already voted on this
+      // poll, don't double-count. Mirrors the Firestore rules.
+      if (data.voters?.[uid] !== undefined) return
+
+      const cur = normalizeVotes(data)
 
       cur[option] = (cur[option] ?? 0) + 1
 
-      tx.update(ref, { votes: cur })
+      // Write the voters map in full (the transaction serializes, so no
+      // concurrent voter is lost). A dotted-field write isn't used because
+      // the emulator doesn't surface it in request.resource.data for rules.
+      tx.update(ref, { votes: cur, voters: { ...(data.voters ?? {}), [uid]: option } })
     }).then(
       () => votePendingRef.current.delete(id),
 
@@ -8265,9 +8318,17 @@ export default function App() {
     else loadMoreFeed()
   }
 
-  const handleNewPoll = (
+  const handleNewPoll = async (
     data: Omit<Poll, "id" | "votes" | "voted" | "comments" | "timeAgo" | "hot" | "createdAt" | "upvotes" | "downvotes" | "userVote">,
   ) => {
+    const user = await ensureAnonAuth()
+
+    if (!user?.uid) {
+      showToast("Post failed — sign-in not ready, try again", 3500)
+
+      return
+    }
+
     const q = data.question.trim().toLowerCase()
 
     if (
@@ -8300,7 +8361,7 @@ export default function App() {
 
       creatorId: anonId,
 
-      creatorUid: auth.currentUser?.uid ?? "",
+      creatorUid: user.uid,
 
       votes: data.options.map(() => 0),
 
