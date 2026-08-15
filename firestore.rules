@@ -12,6 +12,33 @@ service cloud.firestore {
       return s is string && s.size() >= minLen && s.size() <= maxLen;
     }
 
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    function safeVotes() {
+      return request.resource.data.votes is list &&
+        request.resource.data.votes.size() == resource.data.options.size() &&
+        request.resource.data.votes.all(v => v is int && v >= 0 && v <= 1000000);
+    }
+
+    function safeUpvotes() {
+      return request.resource.data.upvotes is int &&
+        request.resource.data.upvotes >= 0 &&
+        request.resource.data.upvotes <= 1000000;
+    }
+
+    function safeDownvotes() {
+      return request.resource.data.downvotes is int &&
+        request.resource.data.downvotes >= 0 &&
+        request.resource.data.downvotes <= 1000000;
+    }
+
+    function safeComments() {
+      return (!changedKeys().hasAny(['comments']) ||
+              isValidCommentsUpdate(request.resource.data.comments));
+    }
+
     function isValidNewPoll(data) {
       return data.question is string &&
         data.question.size() > 0 &&
@@ -85,41 +112,14 @@ service cloud.firestore {
     }
 
     function onlySafeFieldUpdates() {
-      let keys = request.resource.data.diff(resource.data).affectedKeys();
-
-      // Vote fields must stay within safe numeric bounds and match the
-      // option list size; comments must match the validated shape.
-      function safeVotes() {
-        return request.resource.data.votes is list &&
-          request.resource.data.votes.size() == resource.data.options.size() &&
-          request.resource.data.votes.all(v => v is int && v >= 0 && v <= 1000000);
-      }
-
-      function safeUpvotes() {
-        return request.resource.data.upvotes is int &&
-          request.resource.data.upvotes >= 0 &&
-          request.resource.data.upvotes <= 1000000;
-      }
-
-      function safeDownvotes() {
-        return request.resource.data.downvotes is int &&
-          request.resource.data.downvotes >= 0 &&
-          request.resource.data.downvotes <= 1000000;
-      }
-
-      function safeComments() {
-        return (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['comments']) ||
-                isValidCommentsUpdate(request.resource.data.comments));
-      }
-
-      return keys.hasOnly([
+      return changedKeys().hasOnly([
         'votes', 'upvotes', 'downvotes', 'comments', 'archived'
       ]) &&
-        (!keys.hasAny(['votes']) || safeVotes()) &&
-        (!keys.hasAny(['upvotes']) || safeUpvotes()) &&
-        (!keys.hasAny(['downvotes']) || safeDownvotes()) &&
-        (!keys.hasAny(['comments']) || safeComments()) &&
-        (!keys.hasAny(['archived']) || request.resource.data.archived == true);
+        (!changedKeys().hasAny(['votes']) || safeVotes()) &&
+        (!changedKeys().hasAny(['upvotes']) || safeUpvotes()) &&
+        (!changedKeys().hasAny(['downvotes']) || safeDownvotes()) &&
+        (!changedKeys().hasAny(['comments']) || safeComments()) &&
+        (!changedKeys().hasAny(['archived']) || request.resource.data.archived == true);
     }
 
     match /polls/{pollId} {
