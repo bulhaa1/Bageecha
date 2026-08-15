@@ -2,6 +2,9 @@
 
 React + Vite + Tailwind CSS project running inside Figma Make.
 
+## Follow this
+when running a command in this directory "$tmp = "C:\Users\jude\AppData\Local\Temp\opencode" always set timeout for 120seconds.
+
 ## Development Server
 
 A Vite development server is **already running** on `$PORT` (default 8443). You don't need to start it manually.
