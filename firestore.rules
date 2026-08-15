@@ -16,10 +16,13 @@ service cloud.firestore {
       return request.resource.data.diff(resource.data).affectedKeys();
     }
 
+    function pollDurationH(data) {
+      return data.keys().hasAny(['durationH']) ? data.durationH : 48;
+    }
+
     function safeVotes() {
       return request.resource.data.votes is list &&
-        request.resource.data.votes.size() == resource.data.options.size() &&
-        request.resource.data.votes.all(v => v is int && v >= 0 && v <= 1000000);
+        request.resource.data.votes.size() == resource.data.options.size();
     }
 
     function safeUpvotes() {
@@ -36,7 +39,8 @@ service cloud.firestore {
 
     function safeComments() {
       return (!changedKeys().hasAny(['comments']) ||
-              isValidCommentsUpdate(request.resource.data.comments));
+              (request.resource.data.comments is map &&
+               request.resource.data.comments.size() <= 500));
     }
 
     function isValidNewPoll(data) {
@@ -46,14 +50,13 @@ service cloud.firestore {
         data.options is list &&
         data.options.size() >= 2 &&
         data.options.size() <= 7 &&
-        data.options.all(o => o is string && o.size() > 0 && o.size() <= 50) &&
         data.votes is list &&
         data.votes.size() == data.options.size() &&
-        data.votes.all(v => v is int && v >= 0 && v <= 1000000) &&
         data.author is string &&
         data.author.size() > 0 &&
         data.author.size() <= 30 &&
         data.createdAt is number &&
+        data.archived == false &&
         (!data.keys().hasAny(['description']) ||
           (data.description is string && data.description.size() > 0 && data.description.size() <= 280)) &&
         (!data.keys().hasAny(['category']) ||
@@ -66,49 +69,7 @@ service cloud.firestore {
         (!data.keys().hasAny(['creatorId']) || (data.creatorId is string && data.creatorId.size() > 0 && data.creatorId.size() <= 40)) &&
         (!data.keys().hasAny(['creatorUid']) || (data.creatorUid is string && data.creatorUid.size() > 0 && data.creatorUid.size() <= 40)) &&
         (!data.keys().hasAny(['comments']) ||
-          (data.comments is map && data.comments.size() <= 500 &&
-           data.comments.values().all(c => c is map &&
-             c.id is string && c.id.size() > 0 && c.id.size() <= 40 &&
-             c.text is string && c.text.size() > 0 && c.text.size() <= 500 &&
-             c.timeAgo is string && c.timeAgo.size() > 0 && c.timeAgo.size() <= 30 &&
-             c.createdAt is int &&
-             c.likes is int && c.likes >= 0 && c.likes <= 100000 &&
-             c.likedBy is list && c.likedBy.size() <= 500 &&
-             c.likedBy.all(u => u is string && u.size() > 0 && u.size() <= 40) &&
-             (!c.keys().hasAny(['replies']) ||
-               (c.replies is map && c.replies.size() <= 100 &&
-                c.replies.values().all(r => r is map &&
-                  r.id is string && r.id.size() > 0 && r.id.size() <= 40 &&
-                  r.text is string && r.text.size() > 0 && r.text.size() <= 500 &&
-                  r.timeAgo is string && r.timeAgo.size() > 0 && r.timeAgo.size() <= 30 &&
-                  r.createdAt is int &&
-                  r.likes is int && r.likes >= 0 && r.likes <= 100000 &&
-                  r.likedBy is list && r.likedBy.size() <= 500 &&
-                  r.likedBy.all(u => u is string && u.size() > 0 && u.size() <= 40))
-               )))));
-    }
-
-    function isValidCommentsUpdate(comments) {
-      return comments is map && comments.size() <= 500 &&
-        comments.values().all(c => c is map &&
-          c.id is string && c.id.size() > 0 && c.id.size() <= 40 &&
-          c.text is string && c.text.size() > 0 && c.text.size() <= 500 &&
-          c.timeAgo is string && c.timeAgo.size() > 0 && c.timeAgo.size() <= 30 &&
-          c.createdAt is int &&
-          c.likes is int && c.likes >= 0 && c.likes <= 100000 &&
-          c.likedBy is list && c.likedBy.size() <= 500 &&
-          c.likedBy.all(u => u is string && u.size() > 0 && u.size() <= 40) &&
-          (!c.keys().hasAny(['replies']) ||
-            (c.replies is map && c.replies.size() <= 100 &&
-             c.replies.values().all(r => r is map &&
-               r.id is string && r.id.size() > 0 && r.id.size() <= 40 &&
-               r.text is string && r.text.size() > 0 && r.text.size() <= 500 &&
-               r.timeAgo is string && r.timeAgo.size() > 0 && r.timeAgo.size() <= 30 &&
-               r.createdAt is int &&
-               r.likes is int && r.likes >= 0 && r.likes <= 100000 &&
-               r.likedBy is list && r.likedBy.size() <= 500 &&
-               r.likedBy.all(u => u is string && u.size() > 0 && u.size() <= 40)
-             ))));
+          (data.comments is map && data.comments.size() <= 500));
     }
 
     function onlySafeFieldUpdates() {
@@ -124,14 +85,14 @@ service cloud.firestore {
 
     match /polls/{pollId} {
       allow read: if true;
-      allow create: if isValidNewPoll(request.resource.data) &&
-        !request.resource.data.archived;
+      allow create: if isValidNewPoll(request.resource.data);
       allow update: if isAdmin() || onlySafeFieldUpdates();
       allow delete: if isAdmin() ||
         (request.auth != null &&
          request.auth.uid == resource.data.creatorUid &&
          !resource.data.archived &&
-         request.time.millis() - resource.data.createdAt < resource.data.durationH * 3600 * 1000);
+         request.time.toMillis() - resource.data.createdAt <
+           pollDurationH(resource.data) * 3600 * 1000);
     }
   }
 }
