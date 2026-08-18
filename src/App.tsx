@@ -6897,6 +6897,14 @@ export default function App() {
 
   const bootedRef = useRef(false)
 
+  // Stable feed order: live snapshot updates (votes, comments) must not
+  // reshuffle cards on screen. The order is only re-sorted when the user
+  // changes sort/filter/search/view; background data changes update counts
+  // in place instead of jumping cards between positions.
+  const sortedOrderRef = useRef<string[]>([])
+
+  const sortedKeyRef = useRef("")
+
   // Pagination cursors and guards (authoritative flags live in refs so
 
   // snapshot callbacks and async loads never read stale state).
@@ -8573,39 +8581,56 @@ export default function App() {
     [archiveView, archivePolls, polls, search, showMine, anonId, filter],
   )
 
-  const sorted = useMemo(
-    () =>
-      [...filtered].sort((a, b) => {
-        if (archiveView) {
-          const votesA = a.votes.reduce((s, v) => s + v, 0)
-
-          const votesB = b.votes.reduce((s, v) => s + v, 0)
-
-          if (archiveSort === "newest") return b.createdAt - a.createdAt
-
-          return votesB - votesA
-        }
-
+  const sorted = useMemo(() => {
+    const fresh = [...filtered].sort((a, b) => {
+      if (archiveView) {
         const votesA = a.votes.reduce((s, v) => s + v, 0)
 
         const votesB = b.votes.reduce((s, v) => s + v, 0)
 
-        if (sort === "newest") return b.createdAt - a.createdAt
-
-        if (sort === "mostVoted") return votesB - votesA
-
-        if (sort === "popular") return b.upvotes - a.upvotes
-
-        if (sort === "trending" && a.expired !== b.expired)
-          return a.expired ? 1 : -1
-
-        if (a.hot !== b.hot) return a.hot ? -1 : 1
+        if (archiveSort === "newest") return b.createdAt - a.createdAt
 
         return votesB - votesA
-      }),
+      }
 
-    [filtered, archiveView, archiveSort, sort],
-  )
+      const votesA = a.votes.reduce((s, v) => s + v, 0)
+
+      const votesB = b.votes.reduce((s, v) => s + v, 0)
+
+      if (sort === "newest") return b.createdAt - a.createdAt
+
+      if (sort === "mostVoted") return votesB - votesA
+
+      if (sort === "popular") return b.upvotes - a.upvotes
+
+      if (sort === "trending" && a.expired !== b.expired)
+        return a.expired ? 1 : -1
+
+      if (a.hot !== b.hot) return a.hot ? -1 : 1
+
+      return votesB - votesA
+    })
+
+    const orderKey = `${archiveView}|${archiveSort}|${sort}|${filter}|${search}|${showMine}`
+
+    if (sortedKeyRef.current !== orderKey) {
+      sortedKeyRef.current = orderKey
+
+      sortedOrderRef.current = fresh.map((p) => p.id)
+
+      return fresh
+    }
+
+    const byId = new Map(fresh.map((p) => [p.id, p]))
+
+    const kept = sortedOrderRef.current.filter((id) => byId.has(id))
+
+    const newcomers = fresh.filter((p) => !sortedOrderRef.current.includes(p.id))
+
+    sortedOrderRef.current = [...newcomers.map((p) => p.id), ...kept]
+
+    return [...newcomers, ...kept.map((id) => byId.get(id) as Poll)]
+  }, [filtered, archiveView, archiveSort, sort, filter, search, showMine])
 
   // Everything already on screen during the first paint is "seen": entrance
 
