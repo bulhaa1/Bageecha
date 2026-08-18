@@ -5,10 +5,10 @@
     "icon": "favicon.svg"
   },
   "openGraph": {
-    "image": "https://bulhaa1.github.io/Bageecha/og-image.png"
+    "image": "https://bageecha.qd.je/og-image.png"
   },
   "customScripts": {
-    "headStart": "<meta name=\"theme-color\" content=\"#111215\"><meta property=\"og:url\" content=\"https://bulhaa1.github.io/Bageecha/\"><meta property=\"og:type\" content=\"website\"><meta property=\"og:site_name\" content=\"Bageecha\"><link rel=\"apple-touch-icon\" href=\"apple-touch-icon.png\">"
+    "headStart": "<meta name=\"theme-color\" content=\"#111215\"><meta property=\"og:url\" content=\"https://bageecha.qd.je/\"><meta property=\"og:type\" content=\"website\"><meta property=\"og:site_name\" content=\"Bageecha\"><link rel=\"apple-touch-icon\" href=\"apple-touch-icon.png\">"
   },
   "accessibility": {
     "addBypassLinks": false,
