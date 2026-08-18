@@ -565,3 +565,15 @@ body::before {
     animation: none;
   }
 }
+
+/* Mobile: iOS Safari and Android Chrome auto-zoom into any input whose
+   font-size is under 16px and stay zoomed after the field loses focus.
+   Force 16px on every text field so tapping to type never zooms the page.
+   Matches the app's < 640px narrow layout (useIsNarrow). */
+@media (max-width: 639px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}
