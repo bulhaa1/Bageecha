@@ -329,14 +329,9 @@ body::before {
   );
   background-size: 220% 100%;
   background-position: 0% 0;
-  animation: tide 7s linear infinite, line-glow 3.4s ease-in-out infinite;
+  animation: tide 7s linear infinite;
   box-shadow: 0 0 10px var(--primary-glow), 0 0 24px var(--primary-glow),
     0 0 44px color-mix(in srgb, var(--primary) 30%, transparent);
-}
-
-@keyframes line-glow {
-  0%, 100% { opacity: 0.55; filter: brightness(1); }
-  50% { opacity: 1; filter: brightness(1.35); }
 }
 
 /* New-poll box: a breathing neon ring while you're composing inside it */
@@ -563,16 +558,6 @@ body::before {
    visually seamless while colors drift leftward. */
 .logo-flow {
   background-size: 200% auto;
-  animation: gradient-flow 5s linear infinite;
-}
-
-@keyframes gradient-flow {
-  from {
-    background-position: 0% 50%;
-  }
-  to {
-    background-position: 200% 50%;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
