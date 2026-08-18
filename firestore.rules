@@ -89,10 +89,25 @@ service cloud.firestore {
         (!changedKeys().hasAny(['comments']) || safeComments());
     }
 
+    // Auto-archive: any signed-in user (anonymous included) may flip a poll's
+    // archived flag from false to true, but only once the poll is past its
+    // lifetime. Nothing else may change in the same write — no vote tampering,
+    // no early closing, no un-archiving.
+    function isArchiveUpdate() {
+      return request.auth != null &&
+        changedKeys().hasOnly(['archived']) &&
+        resource.data.archived == false &&
+        request.resource.data.archived == true &&
+        request.time.toMillis() - resource.data.createdAt >
+          pollDurationH(resource.data) * 3600 * 1000;
+    }
+
     match /polls/{pollId} {
       allow read: if true;
       allow create: if isValidNewPoll(request.resource.data);
-      allow update: if isAdmin() || onlySafeFieldUpdates();
+      allow update: if isAdmin() ||
+        onlySafeFieldUpdates() ||
+        isArchiveUpdate();
       allow delete: if isAdmin() ||
         (request.auth != null &&
          request.auth.uid == resource.data.creatorUid &&

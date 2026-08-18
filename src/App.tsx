@@ -8549,9 +8549,20 @@ export default function App() {
     signOut(auth).catch(() => {})
   }
 
+  // Every poll the Results tab must be able to show: the archive window
+  // (newest 50) plus the live feed window (newest 60), deduped by id. Without
+  // this an expired poll ranked 51–60 (only in the feed window) would vanish
+  // from the main feed and never appear in the archive either.
+  const archiveViewPolls = useMemo(() => {
+    const byId = new Map<string, Poll>()
+    for (const p of archivePolls) byId.set(p.id, p)
+    for (const p of polls) byId.set(p.id, p)
+    return [...byId.values()]
+  }, [polls, archivePolls])
+
   const filtered = useMemo(
     () =>
-      (archiveView ? archivePolls : polls).filter((p) => {
+      (archiveView ? archiveViewPolls : polls).filter((p) => {
         const q = search.toLowerCase()
 
         const matchSearch =
@@ -8569,7 +8580,10 @@ export default function App() {
             (filter === "all" || p.tags.includes(filter))
           )
 
-        if (p.archived) return false
+        // Closed polls belong in the Results tab, never the live feed.
+        // expired also covers archived polls, so a poll that timed out but
+        // wasn't auto-archived can't leak back into the main feed.
+        if (p.expired) return false
 
         if (showMine && p.creatorId !== anonId) return false
 
@@ -8578,7 +8592,7 @@ export default function App() {
         return matchFilter && matchSearch
       }),
 
-    [archiveView, archivePolls, polls, search, showMine, anonId, filter],
+    [archiveView, archiveViewPolls, polls, search, showMine, anonId, filter],
   )
 
   const sorted = useMemo(() => {
